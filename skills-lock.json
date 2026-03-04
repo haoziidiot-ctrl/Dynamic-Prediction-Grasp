@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "skills": {
+    "api-documentation": {
+      "source": "supercent-io/skills-template",
+      "sourceType": "github",
+      "computedHash": "27f2781ea4b22a3bfaa3047b3e424f618ef9248809029b71f98139a7b50693ce"
+    },
+    "urdf2mjcf": {
+      "source": "plurigrid/asi",
+      "sourceType": "github",
+      "computedHash": "842db3eef60526b746ace8c3d77ba582b120b2509ae41b4dcdaef1f80ce84c2b"
+    }
+  }
+}
