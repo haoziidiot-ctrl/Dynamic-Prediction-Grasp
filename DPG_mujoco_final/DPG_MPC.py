@@ -288,6 +288,9 @@ class MPCController:
         self.target_mocap_id = self.model.body("target").mocapid[0]
 
         self.arm_joint_ids = [self.model.joint(name).id for name in self.arm_joint_names]
+        self.arm_joint_body_ids = np.array(
+            [self.model.jnt_bodyid[j] for j in self.arm_joint_ids], dtype=int
+        )
         self.arm_qpos_indices = np.array([self.model.jnt_qposadr[j] for j in self.arm_joint_ids])
         self.arm_dof_indices = np.array([self.model.jnt_dofadr[j] for j in self.arm_joint_ids])
         self.arm_dof = int(len(self.arm_joint_ids))
@@ -448,9 +451,9 @@ class MPCController:
         # 目标不可达时：先跟踪“最大可达点”，底盘靠近后自然过渡到真实目标
         self.reach_max = float(reach_max)
         self.nullspace_err_scale = 0.25
-        # 平滑：小误差时逐步减小 task feedback，减少抖动；底盘运动用前馈抵消
-        self.feedback_deadband = 0.01
-        self.feedback_ramp = 0.08
+        # 平滑：在接近目标时保持足够反馈增益，避免 target_err 在 0.02m 附近“悬停”
+        self.feedback_deadband = 0.005
+        self.feedback_ramp = 0.03
         self.base_ff_gain = 1.0
         # 额外的任务空间限幅：避免 MPC 在大误差时给出过大的线速度，导致关节速度饱和→抖动
         self.ee_linear_speed_limit = 0.8  # m/s
@@ -565,12 +568,31 @@ class MPCController:
     def _is_forbidden_by_funnel(self, pos_world: np.ndarray, target_world: np.ndarray) -> bool:
         if (not self.enable_funnel_constraint) or self.funnel_depth <= 0.0:
             return False
+        return self._is_in_funnel_geometry(pos_world, target_world)
+
+    def _is_in_funnel_geometry(self, pos_world: np.ndarray, target_world: np.ndarray) -> bool:
+        """纯几何判定（忽略 enable_funnel_constraint 开关），用于实验统计。"""
+        if self.funnel_depth <= 0.0:
+            return False
         x = float(pos_world[0])
         y = float(pos_world[1])
         x_l, x_r, y_l, y_h = self._funnel_bounds(target_world)
         if y < y_l or y > y_h:
             return False
         return (x <= x_l) or (x >= x_r)
+
+    def _arm_keypoints_world(self) -> np.ndarray:
+        """机械臂关键点（6个关节体位置 + 末端site）世界坐标。"""
+        joint_pts = self.data.xpos[self.arm_joint_body_ids].copy()
+        ee_pt = self.data.site_xpos[self.ee_site_id].reshape(1, 3).copy()
+        return np.vstack([joint_pts, ee_pt])
+
+    def _arm_any_in_funnel_geometry(self, target_world: np.ndarray) -> bool:
+        points = self._arm_keypoints_world()
+        for p in points:
+            if self._is_in_funnel_geometry(p, target_world):
+                return True
+        return False
 
     def _project_out_of_funnel(self, pos_world: np.ndarray, target_world: np.ndarray) -> tuple[np.ndarray, bool]:
         """若点落入禁区，投影到最近可行边界（离散安全层）。"""
@@ -1312,7 +1334,14 @@ class MPCController:
         self.time_offset = self.data.time
         return last_dist
 
-    def _control_loop(self, viewer=None, max_time: float = 20.0, callback=None):
+    def _control_loop(
+        self,
+        viewer=None,
+        max_time: float = 20.0,
+        callback=None,
+        step_callback=None,
+        realtime_sync: bool = True,
+    ):
         last_log_time = -np.inf
         step_count = 0
         wall_start = time.time()
@@ -1417,13 +1446,14 @@ class MPCController:
 
                 twist_fb = (twist.copy() if self.use_orientation_task else twist[:3].copy()) * fb_gain
                 twist_ff = np.zeros_like(twist_fb)
-                if (
+                enable_base_ff = (
                     self.intercept_planner is None
                     and (not self.use_pregrasp)
-                    and (not self.use_offset_tracking)
                     and self.is_ball_rel
                     and self.base_traj_for_rel is not None
-                ):
+                    and ((not self.use_offset_tracking) or (self.use_offset_tracking and (not self.offset_active)))
+                )
+                if enable_base_ff:
                     desired_now = self._control_target_world(sim_time=sim_time, abs_time=self.data.time)
                     desired_next = future_world[0]
                     desired_vel = (desired_next - desired_now) / self.control_dt
@@ -1482,6 +1512,11 @@ class MPCController:
                     terminal_err = self._terminal_error(
                         current_pos, future_world[-1], terminal_time
                     )
+                    uncertainty_scale_first = (
+                        float(self._uncertainty_scales_last[0])
+                        if self._uncertainty_scales_last.size > 0
+                        else 1.0
+                    )
                     callback(
                         {
                             "time": float(sim_time),
@@ -1492,6 +1527,10 @@ class MPCController:
                             "terminal_error": terminal_err.copy(),
                             "q": self.data.qpos[self.arm_qpos_indices].copy(),
                             "qdot": qdot_cmd.copy(),
+                            "cond": float(cond_val),
+                            "manip_w": float(self._manip_last_w),
+                            "manip_risk": float(self._manip_last_risk),
+                            "uncertainty_scale_first": uncertainty_scale_first,
                         }
                     )
 
@@ -1509,18 +1548,37 @@ class MPCController:
             sim_time_now = self.data.time - self.time_offset
             target_world_ref_now = self._world_target(sim_time_now)
             current_pos_world_now = self.data.site_xpos[self.ee_site_id].copy()
+            target_err_now = float(np.linalg.norm(current_pos_world_now - target_world_ref_now))
+            hold_ref_now = target_world_ref_now + np.array([0.0, self.offset_y, 0.0], dtype=float)
+            hold_err_now = float(np.linalg.norm(current_pos_world_now - hold_ref_now))
+            in_funnel_now = self._arm_any_in_funnel_geometry(target_world_ref_now)
+            phase_now = "hold" if (self.use_offset_tracking and self.offset_active) else "attach"
+
+            if step_callback is not None:
+                step_callback(
+                    {
+                        "step": int(step_count),
+                        "time": float(sim_time_now),
+                        "abs_time": float(self.data.time),
+                        "phase": phase_now,
+                        "target_err": target_err_now,
+                        "hold_err": hold_err_now,
+                        "attach_err": target_err_now,
+                        "in_funnel": bool(in_funnel_now),
+                        "grasped": bool(self.grasped),
+                    }
+                )
 
             if sim_time - last_log_time >= self.profile_period:
                 # target_err: 始终是 end_finger 到真实 target_world_ref 的距离，不受偏置影响。
-                target_err = float(np.linalg.norm(current_pos_world_now - target_world_ref_now))
                 if self.grasped:
-                    print(f"[grasp success] time={self.data.time:.2f}s, target_err={target_err:.4f} m")
+                    print(
+                        f"[grasp success] time={self.data.time:.2f}s, target_err={target_err_now:.4f} m"
+                    )
                 elif self.use_offset_tracking and self.offset_active:
-                    hold_ref_now = target_world_ref_now + np.array([0.0, self.offset_y, 0.0], dtype=float)
-                    hold_err = float(np.linalg.norm(current_pos_world_now - hold_ref_now))
-                    print(f"[hold] time={self.data.time:.2f}s, hold_err={hold_err:.4f} m")
+                    print(f"[hold] time={self.data.time:.2f}s, hold_err={hold_err_now:.4f} m")
                 else:
-                    print(f"[attach] time={self.data.time:.2f}s, target_err={target_err:.4f} m")
+                    print(f"[attach] time={self.data.time:.2f}s, target_err={target_err_now:.4f} m")
                 last_log_time = sim_time
 
             if self.use_pregrasp and (not self.approach_active) and (not self.use_predictive_phase_switch):
@@ -1560,8 +1618,71 @@ class MPCController:
                     elif self.grasp_action == "stop":
                         break
 
-            if self.dt - compute_elapsed > 0:
+            if realtime_sync and (self.dt - compute_elapsed > 0):
                 time.sleep(self.dt - compute_elapsed)
+
+    def run_headless(
+        self,
+        max_time: float = 15.0,
+        *,
+        step_callback=None,
+        control_callback=None,
+        realtime_sync: bool = False,
+    ) -> dict:
+        """无头运行一次完整流程（warm_start + control），返回回合摘要。"""
+        if self.is_ball_rel and self.base_traj_for_rel is not None and self.chassis_mocap_id >= 0:
+            self._sync_base_traj(0.0)
+            base0 = self.base_traj_for_rel.position(0.0)
+            self.data.mocap_pos[self.chassis_mocap_id] = base0
+            self.data.mocap_quat[self.chassis_mocap_id] = np.array([1.0, 0.0, 0.0, 0.0])
+            mujoco.mj_forward(self.model, self.data)
+
+        start_world = self._world_target(0.0)
+        final_dist = self._warm_start_to_pose(
+            start_world, max_duration=self.warm_start_max, tol=self.warm_start_tol, viewer=None
+        )
+        ee_after = self.data.site_xpos[self.ee_site_id].copy()
+        ball_dist_after = float(np.linalg.norm(ee_after - start_world))
+        desired_after = self._control_target_world(sim_time=0.0, abs_time=self.data.time)
+        dist_des_after = float(np.linalg.norm(ee_after - desired_after))
+        clamp_active = float(np.linalg.norm(desired_after - start_world)) > 1e-6
+        jac_after = self._task_jacobian()
+        jac_task_after = jac_after if self.use_orientation_task else jac_after[:3]
+        cond_after = np.linalg.cond(jac_task_after @ jac_task_after.T)
+        settle_tol = max(self.warm_start_tol, 0.08)
+        nominal_cond_max = 1e6
+        should_update_nominal = (
+            (not clamp_active and ball_dist_after <= settle_tol)
+            or (clamp_active and dist_des_after <= settle_tol)
+        )
+        if should_update_nominal and cond_after <= nominal_cond_max:
+            self.q_nominal = self.data.qpos[self.arm_qpos_indices].copy()
+            nominal_note = "updated"
+        else:
+            self.q_nominal = self.q_nominal_init.copy()
+            nominal_note = "kept_init"
+
+        self._control_loop(
+            viewer=None,
+            max_time=float(max_time),
+            callback=control_callback,
+            step_callback=step_callback,
+            realtime_sync=realtime_sync,
+        )
+        sim_time_now = float(self.data.time - self.time_offset)
+        target_world_now = self._world_target(sim_time_now)
+        ee_now = self.data.site_xpos[self.ee_site_id].copy()
+        final_target_err = float(np.linalg.norm(ee_now - target_world_now))
+        return {
+            "grasped": bool(self.grasped),
+            "sim_time": sim_time_now,
+            "final_target_err": final_target_err,
+            "warm_start_dist_ball": float(ball_dist_after),
+            "warm_start_dist_des": float(dist_des_after),
+            "warm_start_last_dist": float(final_dist),
+            "warm_start_cond": float(cond_after),
+            "q_nominal": nominal_note,
+        }
 
     def run(self):
         print("Launching MPC追踪仿真...")

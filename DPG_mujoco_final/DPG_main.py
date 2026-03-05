@@ -9,6 +9,8 @@ DPG_main.py
 
 from __future__ import annotations
 
+import numpy as np
+
 from DPG_MPC import MPCController
 from DPG_track_ball import get_trajectory
 from DPG_track_ball_in_robot import get_ball_in_robot_trajectory
@@ -33,9 +35,9 @@ if __name__ == "__main__":
     # 约束版本默认关闭 RL 终端价值，专注约束接近策略
     USE_TERMINAL_VALUE = False
     TERMINAL_VALUE_DIM = 3
-    POS_WEIGHT = 12.0
-    # 姿态项略加强：让夹爪轴线对齐世界 +Y 更“硬”，但仍保持动态抓取可收敛
-    ROT_WEIGHT = 0.3
+    POS_WEIGHT = 14.0
+    # 姿态项降低，优先保证位置误差收敛到 grasp 阈值内
+    ROT_WEIGHT = 0.12
     TARGET_FACING_DIR = (0.0, 1.0, 0.0)
 
     # 本版本不使用漏斗禁区约束，只做“偏置轨迹 -> 原轨迹”切换
@@ -71,20 +73,20 @@ if __name__ == "__main__":
 
     USE_OFFSET_TRACKING = True
     OFFSET_Y = -0.13
-    OFFSET_SWITCH_TOL = 0.03
-    OFFSET_SWITCH_STEPS = 6
+    OFFSET_SWITCH_TOL = 0.028
+    OFFSET_SWITCH_STEPS = 8
     WARM_START_MAX = 0.0
 
     # 创新点1：不确定性感知自适应 MPC（KF 协方差 -> 误差项权重）
     ENABLE_UNCERTAINTY_AWARE = True
-    UNCERTAINTY_BETA = 100.0
-    UNCERTAINTY_MIN_SCALE = 0.65
-    UNCERTAINTY_EMA = 0.2
+    UNCERTAINTY_BETA = 60.0
+    UNCERTAINTY_MIN_SCALE = 0.85
+    UNCERTAINTY_EMA = 0.15
 
     # 创新点3：操作度梯度引导（低操作度时给 MPC 一个远离奇异位的任务空间偏置）
     ENABLE_MANIP_GUIDANCE = True
-    MANIP_LAMBDA = 0.06
-    MANIP_W_THRESHOLD = 0.08
+    MANIP_LAMBDA = 0.025
+    MANIP_W_THRESHOLD = 0.06
     MANIP_FD_DELTA = 0.004
     MANIP_GRAD_CLIP = 2.0
     MANIP_HORIZON_DECAY = 0.8
@@ -97,6 +99,11 @@ if __name__ == "__main__":
     GRASP_HOLD_TIME_S = None  # 用 GRASP_HOLD_STEPS(10步)判定成功，避免1s停留导致错失动态抓取窗口
     GRASP_ACTION = "none"  # "none" / "stop" / "attach"
     traj = build_trajectory(OBJECT_TRACK, kf_cfg=KF_CFG)
+    if hasattr(traj, "ball_world"):
+        print(f"[target] ball_world(from trajectory) = {np.asarray(traj.ball_world, dtype=float)}")
+        legacy = np.array([0.25, 0.5, 1.2], dtype=float)
+        delta = np.asarray(traj.ball_world, dtype=float) - legacy
+        print(f"[target] delta vs legacy [0.25,0.5,1.2] = {delta}")
     base = getattr(traj, "base_trajectory", None)
     base_src = getattr(base, "base_trajectory", base)
     if base_src is not None:
