@@ -1,0 +1,12 @@
+rot_weight=0.1
+offset_tol=0.026
+offset_steps=6
+success=1
+dynamic_success=1
+attach_time=2.0100000000000002
+grasp_time=2.2999999999999683
+min_hold_err=0.020068917463627607
+min_target_err=0.015703047147496384
+mean_attach_target_err=0.08317705506675278
+ori_dotY=0.957034886624254
+score=2.931770550667496

@@ -93,11 +93,6 @@ def _build_controller(
         terminal_value_dim=3,
         terminal_approach_dir=(0.0, 1.0, 0.0),
         terminal_approach_axis="x",
-        enable_funnel_constraint=False,
-        funnel_depth=0.10,
-        funnel_half_width=0.05,
-        funnel_margin=1e-3,
-        visualize_funnel_zone=False,
         use_pregrasp=False,
         use_predictive_phase_switch=False,
         use_offset_tracking=True,
@@ -119,7 +114,7 @@ def _build_controller(
         grasp_tol=0.02,
         grasp_hold_steps=10,
         grasp_hold_time_s=None,
-        grasp_action="none",
+        grasp_action="stop",
         profile_period=1e9,
     )
 
@@ -158,7 +153,7 @@ def _run_one_mode(
     *,
     uncertainty_on: bool,
     extra_time: float,
-) -> Dict:
+) -> Tuple[Dict, List[Dict]]:
     traj, base = _make_random_trajectory(params)
     ctrl = _build_controller(traj, uncertainty_on=uncertainty_on)
     base_duration = float(base.duration())
@@ -167,17 +162,15 @@ def _run_one_mode(
     target_err_list: List[float] = []
     hold_err_list: List[float] = []
     attach_err_list: List[float] = []
-    zone_steps = 0
-    zone_entries = 0
-    prev_in_funnel = False
     step_count = 0
-    control_qdot_list: List[np.ndarray] = []
+    step_rows: List[Dict] = []
 
     def on_step(stats: Dict):
-        nonlocal zone_steps, zone_entries, prev_in_funnel, step_count
+        nonlocal step_count
         step_count += 1
-        in_funnel = bool(stats["in_funnel"])
         phase = str(stats["phase"])
+        t = float(stats["time"])
+        step_i = int(stats["step"])
         target_err = float(stats["target_err"])
         hold_err = float(stats["hold_err"])
         attach_err = float(stats["attach_err"])
@@ -188,34 +181,29 @@ def _run_one_mode(
         else:
             attach_err_list.append(attach_err)
 
-        if in_funnel:
-            zone_steps += 1
-            if not prev_in_funnel:
-                zone_entries += 1
-        prev_in_funnel = in_funnel
-
-    def on_control(stats: Dict):
-        qdot = np.asarray(stats["qdot"], dtype=float).reshape(-1)
-        control_qdot_list.append(qdot.copy())
+        step_rows.append(
+            {
+                "step": step_i,
+                "time_s": t,
+                "phase": phase,
+                "target_err": target_err,
+                "hold_err": hold_err if phase == "hold" else "",
+                "attach_err": attach_err if phase == "attach" else "",
+            }
+        )
 
     run_info = ctrl.run_headless(
         max_time=max_time,
         step_callback=on_step,
-        control_callback=on_control,
         realtime_sync=False,
     )
 
-    return {
+    summary = {
         "uncertainty_on": int(bool(uncertainty_on)),
         "base_duration_s": base_duration,
         "max_time_s": max_time,
         "steps_total": int(step_count),
         "sim_time_s": float(run_info["sim_time"]),
-        "success": int(bool(run_info["grasped"])),
-        "zone_steps": int(zone_steps),
-        "zone_time_s": float(zone_steps * ctrl.dt),
-        "zone_ratio": float(zone_steps / max(step_count, 1)),
-        "zone_entries": int(zone_entries),
         "target_err_mean": _safe_mean(target_err_list),
         "target_err_min": float(np.min(target_err_list)) if len(target_err_list) > 0 else np.nan,
         "target_err_p95": _safe_p95(target_err_list),
@@ -225,11 +213,8 @@ def _run_one_mode(
         "attach_steps": int(len(attach_err_list)),
         "attach_err_mean": _safe_mean(attach_err_list),
         "attach_err_p95": _safe_p95(attach_err_list),
-        # 高频抖动指标：误差差分RMS + 控制差分RMS
-        "hf_target_err_diff_rms": _diff_rms_scalar(target_err_list),
-        "hf_attach_err_diff_rms": _diff_rms_scalar(attach_err_list),
-        "hf_qdot_diff_rms": _diff_rms_vector(control_qdot_list),
     }
+    return summary, step_rows
 
 
 def _nanmean(values: List[float]) -> float:
@@ -247,17 +232,10 @@ def _summary_for_mode(rows: List[Dict], uncertainty_on: int) -> Dict:
     return {
         "uncertainty_on": int(uncertainty_on),
         "episodes": n,
-        "success_rate": float(np.mean([r["success"] for r in sub])) if n > 0 else np.nan,
-        "zone_time_mean_s": _nanmean([r["zone_time_s"] for r in sub]),
-        "zone_ratio_mean": _nanmean([r["zone_ratio"] for r in sub]),
-        "zone_entries_mean": _nanmean([r["zone_entries"] for r in sub]),
         "target_err_mean": _nanmean([r["target_err_mean"] for r in sub]),
         "target_err_p95_mean": _nanmean([r["target_err_p95"] for r in sub]),
         "hold_err_mean": _nanmean([r["hold_err_mean"] for r in sub]),
         "attach_err_mean": _nanmean([r["attach_err_mean"] for r in sub]),
-        "hf_target_err_diff_rms_mean": _nanmean([r["hf_target_err_diff_rms"] for r in sub]),
-        "hf_attach_err_diff_rms_mean": _nanmean([r["hf_attach_err_diff_rms"] for r in sub]),
-        "hf_qdot_diff_rms_mean": _nanmean([r["hf_qdot_diff_rms"] for r in sub]),
     }
 
 
@@ -266,9 +244,13 @@ def run_ablation(episodes: int, seed: int, y_noise_std: float, out_dir: Path, ex
     out_dir.mkdir(parents=True, exist_ok=True)
 
     config_path = out_dir / "config.json"
-    per_mode_path = out_dir / "per_episode_mode.csv"
+    per_episode_on_path = out_dir / "per_episode_on.csv"
+    per_episode_off_path = out_dir / "per_episode_off.csv"
+    per_step_on_path = out_dir / "per_step_on.csv"
+    per_step_off_path = out_dir / "per_step_off.csv"
     per_delta_path = out_dir / "per_episode_delta_on_minus_off.csv"
-    summary_mode_path = out_dir / "summary_by_mode.csv"
+    summary_on_path = out_dir / "summary_on.csv"
+    summary_off_path = out_dir / "summary_off.csv"
     summary_delta_path = out_dir / "summary_delta.csv"
 
     with open(config_path, "w", encoding="utf-8") as f:
@@ -292,100 +274,77 @@ def run_ablation(episodes: int, seed: int, y_noise_std: float, out_dir: Path, ex
             indent=2,
         )
 
+    step_fields = ["episode", "step", "time_s", "phase", "target_err", "hold_err", "attach_err"]
     random_params = [_sample_episode_params(rng, y_noise_std=y_noise_std) for _ in range(episodes)]
     all_rows: List[Dict] = []
     delta_rows: List[Dict] = []
+    with open(per_step_on_path, "w", newline="", encoding="utf-8") as step_on_f, open(
+        per_step_off_path, "w", newline="", encoding="utf-8"
+    ) as step_off_f:
+        step_on_writer = csv.DictWriter(step_on_f, fieldnames=step_fields)
+        step_off_writer = csv.DictWriter(step_off_f, fieldnames=step_fields)
+        step_on_writer.writeheader()
+        step_off_writer.writeheader()
+        for ep_idx, params in enumerate(random_params, start=1):
+            row_on, step_rows_on = _run_one_mode(params, uncertainty_on=True, extra_time=extra_time)
+            row_off, step_rows_off = _run_one_mode(params, uncertainty_on=False, extra_time=extra_time)
 
-    for ep_idx, params in enumerate(random_params, start=1):
-        row_on = _run_one_mode(params, uncertainty_on=True, extra_time=extra_time)
-        row_off = _run_one_mode(params, uncertainty_on=False, extra_time=extra_time)
+            common = {
+                "episode": ep_idx,
+                "x_start": params.x_start,
+                "x_end": params.x_end,
+                "speed": params.speed,
+                "y_noise_mean": params.y_noise_mean,
+                "y_noise_std": params.y_noise_std,
+                "noise_seed": params.noise_seed,
+                "kf_seed": params.kf_seed,
+            }
+            row_on.update(common)
+            row_off.update(common)
+            all_rows.extend([row_on, row_off])
+            for s in step_rows_on:
+                step_on_writer.writerow({"episode": ep_idx, **s})
+            for s in step_rows_off:
+                step_off_writer.writerow({"episode": ep_idx, **s})
 
-        common = {
-            "episode": ep_idx,
-            "x_start": params.x_start,
-            "x_end": params.x_end,
-            "speed": params.speed,
-            "y_noise_mean": params.y_noise_mean,
-            "y_noise_std": params.y_noise_std,
-            "noise_seed": params.noise_seed,
-            "kf_seed": params.kf_seed,
-        }
-        row_on.update(common)
-        row_off.update(common)
-        all_rows.extend([row_on, row_off])
+            delta = {
+                "episode": ep_idx,
+                "target_err_mean_delta_on_minus_off": row_on["target_err_mean"] - row_off["target_err_mean"],
+                "attach_err_mean_delta_on_minus_off": row_on["attach_err_mean"] - row_off["attach_err_mean"],
+                "win_attach_err_on": int(row_on["attach_err_mean"] < row_off["attach_err_mean"]),
+            }
+            delta_rows.append(delta)
 
-        delta = {
-            "episode": ep_idx,
-            "success_delta_on_minus_off": row_on["success"] - row_off["success"],
-            "zone_time_delta_on_minus_off": row_on["zone_time_s"] - row_off["zone_time_s"],
-            "zone_ratio_delta_on_minus_off": row_on["zone_ratio"] - row_off["zone_ratio"],
-            "target_err_mean_delta_on_minus_off": row_on["target_err_mean"] - row_off["target_err_mean"],
-            "attach_err_mean_delta_on_minus_off": row_on["attach_err_mean"] - row_off["attach_err_mean"],
-            "hf_target_err_diff_rms_delta_on_minus_off": (
-                row_on["hf_target_err_diff_rms"] - row_off["hf_target_err_diff_rms"]
-            ),
-            "hf_attach_err_diff_rms_delta_on_minus_off": (
-                row_on["hf_attach_err_diff_rms"] - row_off["hf_attach_err_diff_rms"]
-            ),
-            "hf_qdot_diff_rms_delta_on_minus_off": row_on["hf_qdot_diff_rms"] - row_off["hf_qdot_diff_rms"],
-            "win_zone_time_on": int(row_on["zone_time_s"] < row_off["zone_time_s"]),
-            "win_attach_err_on": int(row_on["attach_err_mean"] < row_off["attach_err_mean"]),
-            "win_hf_attach_on": int(
-                np.isfinite(row_on["hf_attach_err_diff_rms"])
-                and np.isfinite(row_off["hf_attach_err_diff_rms"])
-                and (row_on["hf_attach_err_diff_rms"] < row_off["hf_attach_err_diff_rms"])
-            ),
-            "win_hf_qdot_on": int(
-                np.isfinite(row_on["hf_qdot_diff_rms"])
-                and np.isfinite(row_off["hf_qdot_diff_rms"])
-                and (row_on["hf_qdot_diff_rms"] < row_off["hf_qdot_diff_rms"])
-            ),
-        }
-        delta_rows.append(delta)
+            print(
+                f"[episode {ep_idx:03d}/{episodes}] "
+                f"ON(target_err={row_on['target_err_mean']:.4f}, attach_err={row_on['attach_err_mean']:.4f}) | "
+                f"OFF(target_err={row_off['target_err_mean']:.4f}, attach_err={row_off['attach_err_mean']:.4f})"
+            )
 
-        print(
-            f"[episode {ep_idx:03d}/{episodes}] "
-            f"ON(success={row_on['success']}, zone_t={row_on['zone_time_s']:.3f}s, hf_attach={row_on['hf_attach_err_diff_rms']:.5f}) | "
-            f"OFF(success={row_off['success']}, zone_t={row_off['zone_time_s']:.3f}s, hf_attach={row_off['hf_attach_err_diff_rms']:.5f})"
-        )
-
-    mode_fields = [
+    episode_fields = [
         "episode",
-        "uncertainty_on",
-        "x_start",
-        "x_end",
-        "speed",
-        "y_noise_mean",
-        "y_noise_std",
-        "noise_seed",
-        "kf_seed",
-        "base_duration_s",
-        "max_time_s",
-        "steps_total",
-        "sim_time_s",
-        "success",
-        "zone_steps",
-        "zone_time_s",
-        "zone_ratio",
-        "zone_entries",
         "target_err_mean",
         "target_err_min",
         "target_err_p95",
-        "hold_steps",
         "hold_err_mean",
         "hold_err_p95",
-        "attach_steps",
         "attach_err_mean",
         "attach_err_p95",
-        "hf_target_err_diff_rms",
-        "hf_attach_err_diff_rms",
-        "hf_qdot_diff_rms",
     ]
-    with open(per_mode_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=mode_fields)
+    rows_on = [r for r in all_rows if int(r["uncertainty_on"]) == 1]
+    rows_off = [r for r in all_rows if int(r["uncertainty_on"]) == 0]
+    with open(per_episode_on_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=episode_fields)
         writer.writeheader()
-        for r in all_rows:
-            writer.writerow(r)
+        for r in rows_on:
+            out = {k: r[k] for k in episode_fields}
+            writer.writerow(out)
+    with open(per_episode_off_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=episode_fields)
+        writer.writeheader()
+        for r in rows_off:
+            out = {k: r[k] for k in episode_fields}
+            writer.writerow(out)
 
     delta_fields = list(delta_rows[0].keys()) if len(delta_rows) > 0 else ["episode"]
     with open(per_delta_path, "w", newline="", encoding="utf-8") as f:
@@ -396,11 +355,16 @@ def run_ablation(episodes: int, seed: int, y_noise_std: float, out_dir: Path, ex
 
     summary_on = _summary_for_mode(all_rows, uncertainty_on=1)
     summary_off = _summary_for_mode(all_rows, uncertainty_on=0)
-    with open(summary_mode_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(summary_on.keys()))
+    summary_on_out = {k: v for k, v in summary_on.items() if k != "uncertainty_on"}
+    summary_off_out = {k: v for k, v in summary_off.items() if k != "uncertainty_on"}
+    with open(summary_on_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary_on_out.keys()))
         writer.writeheader()
-        writer.writerow(summary_on)
-        writer.writerow(summary_off)
+        writer.writerow(summary_on_out)
+    with open(summary_off_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary_off_out.keys()))
+        writer.writeheader()
+        writer.writerow(summary_off_out)
 
     def _mean_delta(key: str) -> float:
         vals = [float(r[key]) for r in delta_rows]
@@ -408,22 +372,9 @@ def run_ablation(episodes: int, seed: int, y_noise_std: float, out_dir: Path, ex
 
     summary_delta = {
         "episodes": episodes,
-        "success_delta_on_minus_off_mean": _mean_delta("success_delta_on_minus_off"),
-        "zone_time_delta_on_minus_off_mean": _mean_delta("zone_time_delta_on_minus_off"),
-        "zone_ratio_delta_on_minus_off_mean": _mean_delta("zone_ratio_delta_on_minus_off"),
         "target_err_mean_delta_on_minus_off_mean": _mean_delta("target_err_mean_delta_on_minus_off"),
         "attach_err_mean_delta_on_minus_off_mean": _mean_delta("attach_err_mean_delta_on_minus_off"),
-        "hf_target_err_diff_rms_delta_on_minus_off_mean": _mean_delta(
-            "hf_target_err_diff_rms_delta_on_minus_off"
-        ),
-        "hf_attach_err_diff_rms_delta_on_minus_off_mean": _mean_delta(
-            "hf_attach_err_diff_rms_delta_on_minus_off"
-        ),
-        "hf_qdot_diff_rms_delta_on_minus_off_mean": _mean_delta("hf_qdot_diff_rms_delta_on_minus_off"),
-        "win_zone_time_on_rate": _nanmean([float(r["win_zone_time_on"]) for r in delta_rows]),
         "win_attach_err_on_rate": _nanmean([float(r["win_attach_err_on"]) for r in delta_rows]),
-        "win_hf_attach_on_rate": _nanmean([float(r["win_hf_attach_on"]) for r in delta_rows]),
-        "win_hf_qdot_on_rate": _nanmean([float(r["win_hf_qdot_on"]) for r in delta_rows]),
     }
     with open(summary_delta_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(summary_delta.keys()))
@@ -431,9 +382,13 @@ def run_ablation(episodes: int, seed: int, y_noise_std: float, out_dir: Path, ex
         writer.writerow(summary_delta)
 
     print("\n[done] uncertainty ablation finished.")
-    print(f"  per-mode   : {per_mode_path}")
+    print(f"  per-ep-on  : {per_episode_on_path}")
+    print(f"  per-ep-off : {per_episode_off_path}")
+    print(f"  step-on    : {per_step_on_path}")
+    print(f"  step-off   : {per_step_off_path}")
     print(f"  per-delta  : {per_delta_path}")
-    print(f"  summary    : {summary_mode_path}")
+    print(f"  summary-on : {summary_on_path}")
+    print(f"  summary-off: {summary_off_path}")
     print(f"  delta-sum  : {summary_delta_path}")
     print(f"  config     : {config_path}")
 
@@ -453,7 +408,7 @@ def parse_args():
     parser.add_argument(
         "--extra-time",
         type=float,
-        default=6.0,
+        default=4.0,
         help="extra simulation time added to each episode after base duration",
     )
     parser.add_argument(
@@ -493,4 +448,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

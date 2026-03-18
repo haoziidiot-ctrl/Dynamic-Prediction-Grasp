@@ -57,8 +57,6 @@ def build_controller(c: Candidate) -> MPCController:
         terminal_value_dim=3,
         terminal_approach_dir=(0.0, 1.0, 0.0),
         terminal_approach_axis="x",
-        enable_funnel_constraint=False,
-        visualize_funnel_zone=False,
         use_pregrasp=False,
         use_predictive_phase_switch=False,
         use_offset_tracking=True,
@@ -131,7 +129,16 @@ def run_once(
                 offset_target = future_world[0].copy()
                 offset_dist = float(np.linalg.norm(current_pos_world - offset_target))
                 ctrl._offset_last_dist = offset_dist
-                if offset_dist <= ctrl.offset_trigger_tol:
+                target_x = float(target_world_ref[0])
+                x_gate_threshold = target_x - ctrl.offset_switch_x_front
+                if ctrl.offset_switch_x_gate_enable:
+                    x_gate_ready = float(current_pos_world[0]) >= x_gate_threshold
+                else:
+                    x_gate_ready = True
+                ctrl._offset_x_gate_ready = bool(x_gate_ready)
+                ctrl._offset_x_gate_threshold = float(x_gate_threshold)
+                ctrl._offset_x_gate_delta = float(current_pos_world[0] - x_gate_threshold)
+                if x_gate_ready:
                     ctrl._offset_hit_count += 1
                 else:
                     ctrl._offset_hit_count = 0

@@ -35,26 +35,30 @@ if __name__ == "__main__":
     # 约束版本默认关闭 RL 终端价值，专注约束接近策略
     USE_TERMINAL_VALUE = False
     TERMINAL_VALUE_DIM = 3
-    POS_WEIGHT = 14.0
-    # 姿态项降低，优先保证位置误差收敛到 grasp 阈值内
-    ROT_WEIGHT = 0.12
+    # 全程姿态参考固定朝向世界 +Y；位置项仍偏强，但不再像上一版那样过激
+    POS_WEIGHT = 26.0
+    ROT_WEIGHT = 0.10
+    SMOOTH_WEIGHT = 1.5e-3
     TARGET_FACING_DIR = (0.0, 1.0, 0.0)
+    # GUI 性能参数：60Hz 渲染 + 0.1s 一次简化日志
+    RENDER_DT = 1.0 / 60.0
+    PROFILE_PERIOD = 0.1
 
-    # 本版本不使用漏斗禁区约束，只做“偏置轨迹 -> 原轨迹”切换
-    ENABLE_FUNNEL_CONSTRAINT = False
-    FUNNEL_DEPTH = 0.10
-    FUNNEL_HALF_WIDTH = 0.05
-    FUNNEL_MARGIN = 1e-3
-    # scene.xml 里已经有禁区可视化 geom，运行时再次绘制会出现重影/看起来像多一个禁区。
-    VISUALIZE_FUNNEL_ZONE = False
-    FUNNEL_VIS_X_EXTENT = 1.2
-    FUNNEL_VIS_Z_HALF = 1.0
-    FUNNEL_VIS_RGBA = (1.0, 0.95, 0.45, 0.22)  # 淡黄色透明
+    # 约束MPC: 使用 OSQP 求解带硬约束的QP
+    USE_CONSTRAINED_QP = True
+    QP_SOLVER = "osqp"
+    QP_INFEASIBLE_POLICY = "hold"
+    QP_ENFORCE_JOINT_POS = True
+    QP_ENFORCE_JOINT_VEL = True
+    QP_ENFORCE_EE_X_UPPER = True
+    QP_EE_X_MARGIN = 0.02
+    QP_ENFORCE_EE_Y_UPPER = True
+    QP_EE_Y_MARGIN = 0.0
 
     # 两阶段切换：
     # 1) 第一阶段跟踪 target + [0, OFFSET_Y, 0]
-    # 2) 当末端到第一阶段参考的距离 < OFFSET_SWITCH_TOL，且连续命中 OFFSET_SWITCH_STEPS 个控制步后，
-    #    立即切到第二阶段（去掉偏置，直接跟踪原目标轨迹）
+    # 2) 当末端 x 到达 (target_x - OFFSET_SWITCH_X_FRONT) 后，
+    #    连续命中 OFFSET_SWITCH_STEPS 个控制步即切到第二阶段（去掉偏置，直接跟踪原目标轨迹）
     ENABLE_PREGRASP = False
     PREGRASP_OFFSET = 0.0
     PREGRASP_DIR = (0.0, 1.0, 0.0)
@@ -73,8 +77,19 @@ if __name__ == "__main__":
 
     USE_OFFSET_TRACKING = True
     OFFSET_Y = -0.13
-    OFFSET_SWITCH_TOL = 0.028
+    OFFSET_RELEASE_TIME_S = 0.25
+    HOLD_POS_WEIGHT_SCALE = 1.0
+    ATTACH_POS_WEIGHT_SCALE = 1.45
+    HOLD_X_ERROR_GAIN = 1.0
+    ATTACH_X_ERROR_GAIN = 1.35
+    HOLD_ORIENTATION_GAIN = 1.0
+    ATTACH_ORIENTATION_GAIN = 0.28
+    OFFSET_SWITCH_TOL = 0.02  # 兼容保留
     OFFSET_SWITCH_STEPS = 8
+    OFFSET_SWITCH_X_GATE_ENABLE = True
+    OFFSET_SWITCH_X_FRONT = 0.20
+    OFFSET_SWITCH_X_ALIGN_TOL = 0.04
+    OFFSET_SWITCH_YZ_TOL = 0.09
     WARM_START_MAX = 0.0
 
     # 创新点1：不确定性感知自适应 MPC（KF 协方差 -> 误差项权重）
@@ -84,13 +99,18 @@ if __name__ == "__main__":
     UNCERTAINTY_EMA = 0.15
 
     # 创新点3：操作度梯度引导（低操作度时给 MPC 一个远离奇异位的任务空间偏置）
-    ENABLE_MANIP_GUIDANCE = True
+    # 当前目标是更快进入 success，先关闭会引入末端偏置的操作度引导
+    ENABLE_MANIP_GUIDANCE = False
     MANIP_LAMBDA = 0.025
     MANIP_W_THRESHOLD = 0.06
     MANIP_FD_DELTA = 0.004
     MANIP_GRAD_CLIP = 2.0
     MANIP_HORIZON_DECAY = 0.8
     MANIP_FIRST_STEP_ONLY = False
+
+    # attach 阶段保留一定底盘运动补偿，但把动作幅度收回来
+    BASE_FF_GAIN = 1.0
+    EE_LINEAR_SPEED_LIMIT = 1.0
 
     ENABLE_GRASP = True
     # grasp success 判定：end_finger 到真实 target 距离需小于 0.02 m
@@ -119,20 +139,15 @@ if __name__ == "__main__":
         warm_start_max=WARM_START_MAX,
         pos_weight=POS_WEIGHT,
         rot_weight=ROT_WEIGHT,
+        smooth_weight=SMOOTH_WEIGHT,
+        render_dt=RENDER_DT,
+        profile_period=PROFILE_PERIOD,
         use_terminal_value=USE_TERMINAL_VALUE,
         terminal_value_dim=TERMINAL_VALUE_DIM,
         terminal_approach_dir=TARGET_FACING_DIR,
         # 由当前 MJCF 姿态可得：gripper/end_finger 局部 x 轴在初始时指向世界 +Z。
         # 因此若要“夹爪轴线”最终朝向世界 +Y，就应约束局部 x 轴 -> 世界 +Y。
         terminal_approach_axis="x",
-        enable_funnel_constraint=ENABLE_FUNNEL_CONSTRAINT,
-        funnel_depth=FUNNEL_DEPTH,
-        funnel_half_width=FUNNEL_HALF_WIDTH,
-        funnel_margin=FUNNEL_MARGIN,
-        visualize_funnel_zone=VISUALIZE_FUNNEL_ZONE,
-        funnel_vis_x_extent=FUNNEL_VIS_X_EXTENT,
-        funnel_vis_z_half=FUNNEL_VIS_Z_HALF,
-        funnel_vis_rgba=FUNNEL_VIS_RGBA,
         use_pregrasp=ENABLE_PREGRASP,
         pregrasp_offset=PREGRASP_OFFSET,
         pregrasp_dir=PREGRASP_DIR,
@@ -150,8 +165,19 @@ if __name__ == "__main__":
         phase_instant_attack=PHASE_INSTANT_ATTACK,
         use_offset_tracking=USE_OFFSET_TRACKING,
         offset_y=OFFSET_Y,
+        offset_release_time_s=OFFSET_RELEASE_TIME_S,
+        hold_pos_weight_scale=HOLD_POS_WEIGHT_SCALE,
+        attach_pos_weight_scale=ATTACH_POS_WEIGHT_SCALE,
+        hold_x_error_gain=HOLD_X_ERROR_GAIN,
+        attach_x_error_gain=ATTACH_X_ERROR_GAIN,
+        hold_orientation_gain=HOLD_ORIENTATION_GAIN,
+        attach_orientation_gain=ATTACH_ORIENTATION_GAIN,
         offset_trigger_tol=OFFSET_SWITCH_TOL,
         offset_trigger_steps=OFFSET_SWITCH_STEPS,
+        offset_switch_x_gate_enable=OFFSET_SWITCH_X_GATE_ENABLE,
+        offset_switch_x_front=OFFSET_SWITCH_X_FRONT,
+        offset_switch_x_align_tol=OFFSET_SWITCH_X_ALIGN_TOL,
+        offset_switch_yz_tol=OFFSET_SWITCH_YZ_TOL,
         use_uncertainty_aware_weighting=ENABLE_UNCERTAINTY_AWARE,
         uncertainty_beta=UNCERTAINTY_BETA,
         uncertainty_min_scale=UNCERTAINTY_MIN_SCALE,
@@ -163,9 +189,20 @@ if __name__ == "__main__":
         manipulability_grad_clip=MANIP_GRAD_CLIP,
         manipulability_horizon_decay=MANIP_HORIZON_DECAY,
         manipulability_first_step_only=MANIP_FIRST_STEP_ONLY,
+        base_ff_gain=BASE_FF_GAIN,
+        ee_linear_speed_limit=EE_LINEAR_SPEED_LIMIT,
         enable_grasp=ENABLE_GRASP,
         grasp_tol=GRASP_TOL,
         grasp_hold_steps=GRASP_HOLD_STEPS,
         grasp_hold_time_s=GRASP_HOLD_TIME_S,
         grasp_action=GRASP_ACTION,
+        use_constrained_qp=USE_CONSTRAINED_QP,
+        qp_solver=QP_SOLVER,
+        qp_infeasible_policy=QP_INFEASIBLE_POLICY,
+        qp_enforce_joint_pos=QP_ENFORCE_JOINT_POS,
+        qp_enforce_joint_vel=QP_ENFORCE_JOINT_VEL,
+        qp_enforce_ee_x_upper=QP_ENFORCE_EE_X_UPPER,
+        qp_ee_x_margin=QP_EE_X_MARGIN,
+        qp_enforce_ee_y_upper=QP_ENFORCE_EE_Y_UPPER,
+        qp_ee_y_margin=QP_EE_Y_MARGIN,
     ).run()

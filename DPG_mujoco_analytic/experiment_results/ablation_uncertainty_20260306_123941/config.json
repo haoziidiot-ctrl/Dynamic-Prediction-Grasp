@@ -1,0 +1,30 @@
+{
+  "episodes": 200,
+  "seed": 20260306,
+  "ball_world": [
+    0.25,
+    0.5,
+    1.2
+  ],
+  "ablation": "uncertainty_aware_weighting on/off",
+  "random_ranges": {
+    "x_start": [
+      -1.1,
+      -0.5
+    ],
+    "x_end": [
+      0.2,
+      0.8
+    ],
+    "speed": [
+      0.1,
+      0.5
+    ],
+    "y_noise_mean": [
+      0.005,
+      0.02
+    ],
+    "y_noise_std_fixed": 0.005
+  },
+  "fairness": "paired same-random-params per episode"
+}

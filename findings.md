@@ -1,0 +1,34 @@
+# Findings
+
+- `DPG_mujoco_final copy/DPG_track_ball_in_robot.py`
+  - 新增了基于一维双积分器 LQR 的辅助反馈增益。
+  - 新增 `future_covariances_xy_closed_loop(...)`，显式传播闭环协方差：`Σ_{k+1} = F_cl Σ_k F_cl^T + Q`。
+- `DPG_mujoco_final copy/DPG_MPC.py`
+  - stochastic 模式下，约束 backoff 优先使用闭环协方差序列。
+  - QP 分支执行层已加入 tube-style 任务空间补偿。
+  - `run_headless()` 现在直接返回 attach_time / grasp_time / best_target_err / qp_infeasible_count / max_backoff_y / stochastic_cov_mode，便于无头对比而不依赖 step_callback。
+- 回归根因定位
+  - `use_stochastic_mpc=False` 时，`copy` 版本应退化为基础 MPC，但实际仍比原 `DPG_mujoco_final` 明显更差。
+  - 真正的回归点有两个：
+    - QP 分支无条件调用 `_limit_twist_cmd(...)`，把基础版 task-space 指令错误限幅。
+    - stochastic 关闭时，协方差查询改用了 `_ball_rel_traj_time(sim_time, abs_time)`，改变了原版的时间基准。
+  - 这两点修复后，`copy` 版基础 MPC 已恢复到原版水平。
+- Headless 对照结果（修复后，`compare_stochastic_mpc.py`）
+  - basic summary:
+    - `success_rate=1.00`
+    - `success_time_mean=2.213 s`
+    - `min_target_err_mean=0.0177 m`
+    - `final_target_err_mean=0.0185 m`
+    - `qp_infeasible_mean=0.00`
+  - stochastic summary（chance backoff 开启，tube 默认关闭）:
+    - `success_rate=1.00`
+    - `success_time_mean=2.305 s`
+    - `min_target_err_mean=0.0169 m`
+    - `final_target_err_mean=0.0180 m`
+    - `qp_infeasible_mean=0.33`
+    - `max_backoff_y_mean=0.0600 m`
+  - 结论：当前场景下 stochastic 版主要带来动态安全裕量，末端最小误差略好，但成功时间略慢，没有形成速度上的提升。
+- Tube-style 补偿结论
+  - 只要打开 `stochastic_use_tube_feedback=True`，就会显著恶化跟踪并触发大量 OSQP `maximum iterations reached`。
+  - 关闭 tube、仅保留 chance backoff 后，stochastic 版恢复正常。
+  - 原因是当前这套每拍重解的 receding-horizon 架构已经用“真实状态 -> MPC”形成主反馈；再叠一层基于当前位置误差的 task-space 补偿，会和主反馈打架，导致过度修正。

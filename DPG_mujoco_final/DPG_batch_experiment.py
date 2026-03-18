@@ -3,8 +3,7 @@ DPG_batch_experiment.py
 
 无头批量综合实验入口（默认200回合）：
 1) 成功率（grasp success）
-2) 机械臂任一点进入禁区时间（任一关节或末端进入即计时）
-3) 分阶段跟踪误差（hold/attach 每步误差）
+2) 分阶段跟踪误差（hold/attach 每步误差）
 """
 
 from __future__ import annotations
@@ -85,11 +84,6 @@ def _build_controller(traj: BallInRobotFrameTrajectory) -> MPCController:
         terminal_value_dim=3,
         terminal_approach_dir=(0.0, 1.0, 0.0),
         terminal_approach_axis="x",
-        enable_funnel_constraint=False,
-        funnel_depth=0.10,
-        funnel_half_width=0.05,
-        funnel_margin=1e-3,
-        visualize_funnel_zone=False,
         use_pregrasp=False,
         use_predictive_phase_switch=False,
         use_offset_tracking=True,
@@ -150,12 +144,6 @@ def run_batch(episodes: int, seed: int, y_noise_std: float, out_dir: Path, extra
                     "y_noise_mean": [0.005, 0.02],
                     "y_noise_std_fixed": y_noise_std,
                 },
-                "forbidden_zone": {
-                    "x": "(-inf, x_t-0.05] U [x_t+0.05, +inf)",
-                    "y": "[y_t-0.10, y_t]",
-                    "z": "all",
-                    "rule": "any arm joint body or end_finger in zone => in_funnel=True",
-                },
             },
             f,
             ensure_ascii=False,
@@ -176,9 +164,6 @@ def run_batch(episodes: int, seed: int, y_noise_std: float, out_dir: Path, extra
         "steps_total",
         "sim_time_s",
         "success",
-        "zone_steps",
-        "zone_time_s",
-        "zone_ratio",
         "target_err_mean",
         "target_err_min",
         "target_err_p95",
@@ -197,14 +182,11 @@ def run_batch(episodes: int, seed: int, y_noise_std: float, out_dir: Path, extra
         "target_err",
         "hold_err",
         "attach_err",
-        "in_funnel",
         "grasped",
     ]
 
     success_count = 0
     global_steps = 0
-    global_zone_steps = 0
-    global_zone_time_s = 0.0
     global_hold_err_sum = 0.0
     global_hold_steps = 0
     global_attach_err_sum = 0.0
@@ -228,13 +210,11 @@ def run_batch(episodes: int, seed: int, y_noise_std: float, out_dir: Path, extra
             target_err_list: list[float] = []
             hold_err_list: list[float] = []
             attach_err_list: list[float] = []
-            zone_steps = 0
             step_count = 0
 
             def on_step(stats: Dict):
-                nonlocal zone_steps, step_count
+                nonlocal step_count
                 step_count += 1
-                in_funnel = bool(stats["in_funnel"])
                 phase = str(stats["phase"])
                 target_err = float(stats["target_err"])
                 hold_err = float(stats["hold_err"])
@@ -245,8 +225,6 @@ def run_batch(episodes: int, seed: int, y_noise_std: float, out_dir: Path, extra
                     hold_err_list.append(hold_err)
                 else:
                     attach_err_list.append(attach_err)
-                if in_funnel:
-                    zone_steps += 1
 
                 step_writer.writerow(
                     {
@@ -257,7 +235,6 @@ def run_batch(episodes: int, seed: int, y_noise_std: float, out_dir: Path, extra
                         "target_err": target_err,
                         "hold_err": hold_err if phase == "hold" else "",
                         "attach_err": attach_err if phase == "attach" else "",
-                        "in_funnel": int(in_funnel),
                         "grasped": int(bool(stats["grasped"])),
                     }
                 )
@@ -269,13 +246,9 @@ def run_batch(episodes: int, seed: int, y_noise_std: float, out_dir: Path, extra
             )
 
             success = int(bool(run_info["grasped"]))
-            zone_time_s = float(zone_steps * ctrl.dt)
-            zone_ratio = float(zone_steps / max(step_count, 1))
 
             success_count += success
             global_steps += step_count
-            global_zone_steps += zone_steps
-            global_zone_time_s += zone_time_s
             global_hold_steps += len(hold_err_list)
             global_attach_steps += len(attach_err_list)
             global_hold_err_sum += float(np.sum(hold_err_list)) if len(hold_err_list) > 0 else 0.0
@@ -298,9 +271,6 @@ def run_batch(episodes: int, seed: int, y_noise_std: float, out_dir: Path, extra
                     "steps_total": step_count,
                     "sim_time_s": float(run_info["sim_time"]),
                     "success": success,
-                    "zone_steps": zone_steps,
-                    "zone_time_s": zone_time_s,
-                    "zone_ratio": zone_ratio,
                     "target_err_mean": _safe_mean(target_err_list),
                     "target_err_min": float(np.min(target_err_list)) if len(target_err_list) > 0 else np.nan,
                     "target_err_p95": _safe_p95(target_err_list),
@@ -316,8 +286,7 @@ def run_batch(episodes: int, seed: int, y_noise_std: float, out_dir: Path, extra
             step_f.flush()
             print(
                 f"[episode {ep:03d}/{episodes}] success={success}, "
-                f"zone_time={zone_time_s:.3f}s, steps={step_count}, "
-                f"mean_target_err={_safe_mean(target_err_list):.4f}m"
+                f"steps={step_count}, mean_target_err={_safe_mean(target_err_list):.4f}m"
             )
 
     summary_row = {
@@ -325,10 +294,6 @@ def run_batch(episodes: int, seed: int, y_noise_std: float, out_dir: Path, extra
         "success_count": success_count,
         "success_rate": float(success_count / max(episodes, 1)),
         "total_steps": global_steps,
-        "zone_steps_total": global_zone_steps,
-        "zone_time_total_s": float(global_zone_time_s),
-        "zone_time_mean_s_per_episode": float(global_zone_time_s / max(episodes, 1)),
-        "zone_step_ratio": float(global_zone_steps / max(global_steps, 1)),
         "hold_steps_total": global_hold_steps,
         "hold_err_mean_global": float(global_hold_err_sum / max(global_hold_steps, 1)),
         "attach_steps_total": global_attach_steps,

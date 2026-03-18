@@ -5,7 +5,6 @@ DPG_MPC.py
     - TaskSpaceMPC: 无约束 QP（可选终端代价）。
     - MPCController: 接收轨迹（机械臂基坐标系），转换为世界坐标写入 mocap，并通过雅可比分解积分得到关节角目标，写入 position 伺服。
     - 预测分阶段策略: 基于未来视界判定进入“最佳作业区”的时机，执行蛰伏→出击切换。
-    - Funnel 约束层: 在目标前方禁区加入离散安全过滤，限制末端只能经过漏斗通道靠近目标。
 
 轨迹约定：
     - Ball 轨迹: position 返回以机械臂基座标系为原点的目标坐标，需加回 base_origin 成为世界坐标。
@@ -21,6 +20,12 @@ from typing import Optional, Union
 import mujoco
 import mujoco.viewer
 import numpy as np
+import scipy.sparse as sp
+
+try:
+    import osqp
+except Exception:  # pragma: no cover - 仅在启用约束QP时强依赖
+    osqp = None
 
 from DPG_track_ball import TrajectoryProvider, MocapBallTrajectory
 from DPG_track_ball_in_robot import BallInRobotFrameTrajectory
@@ -99,6 +104,13 @@ class TaskSpaceMPC:
         else:
             pick_lin = np.vstack([np.eye(self.task_dim), np.zeros((1, self.task_dim))])
         self.C_term = self.dt * np.kron(np.ones((1, self.horizon)), pick_lin)
+        self.x_prediction_matrix = self.A[:: self.task_dim, :].copy()
+        self.y_prediction_matrix = self.A[1:: self.task_dim, :].copy()
+        self.last_solve_ok = True
+        self.last_solve_status = "direct"
+        self.last_solver = "direct"
+        self._osqp_prob = None
+        self._osqp_cache_sig = None
 
     def _build_B_matrix(self) -> np.ndarray:
         n = self.task_dim * self.horizon
@@ -120,6 +132,55 @@ class TaskSpaceMPC:
             diag[idx + 3 : idx + 6] = self.rot_weight
         return np.diag(diag)
 
+    def _solve_with_osqp_cached(
+        self,
+        p_csc: sp.csc_matrix,
+        q: np.ndarray,
+        a_csc: sp.csc_matrix,
+        l: np.ndarray,
+        u: np.ndarray,
+    ):
+        sig = (p_csc.shape, int(p_csc.nnz), a_csc.shape, int(a_csc.nnz))
+        rebuild = self._osqp_prob is None or self._osqp_cache_sig != sig
+        if rebuild:
+            prob = osqp.OSQP()
+            prob.setup(
+                P=p_csc,
+                q=q,
+                A=a_csc,
+                l=l,
+                u=u,
+                verbose=False,
+                warm_start=True,
+                polish=False,
+                eps_abs=1e-5,
+                eps_rel=1e-5,
+                max_iter=4000,
+            )
+            self._osqp_prob = prob
+            self._osqp_cache_sig = sig
+        else:
+            try:
+                self._osqp_prob.update(q=q, l=l, u=u, Px=p_csc.data, Ax=a_csc.data)
+            except Exception:
+                prob = osqp.OSQP()
+                prob.setup(
+                    P=p_csc,
+                    q=q,
+                    A=a_csc,
+                    l=l,
+                    u=u,
+                    verbose=False,
+                    warm_start=True,
+                    polish=False,
+                    eps_abs=1e-5,
+                    eps_rel=1e-5,
+                    max_iter=4000,
+                )
+                self._osqp_prob = prob
+                self._osqp_cache_sig = sig
+        return self._osqp_prob.solve()
+
     def solve(
         self,
         error_vector: np.ndarray,
@@ -128,6 +189,10 @@ class TaskSpaceMPC:
         desired_terminal: Optional[np.ndarray] = None,
         pos_weight_scales: Optional[np.ndarray] = None,
         extra_rhs: Optional[np.ndarray] = None,
+        linear_constraint_matrix: Optional[np.ndarray] = None,
+        linear_lower_bound: Optional[np.ndarray] = None,
+        linear_upper_bound: Optional[np.ndarray] = None,
+        qp_solver: str = "osqp",
     ) -> np.ndarray:
         if error_vector.shape[0] != self.task_dim * self.horizon:
             raise ValueError("error_vector 尺寸错误")
@@ -168,8 +233,61 @@ class TaskSpaceMPC:
             H += self.C_term.T @ h_term @ self.C_term
             rhs += self.C_term.T @ (h_term @ e0 + g_term)
 
-        self.full_solution = np.linalg.solve(H, rhs)
-        twist = self.full_solution[: self.task_dim]
+        if linear_constraint_matrix is None:
+            self.full_solution = np.linalg.solve(H, rhs)
+            twist = self.full_solution[: self.task_dim]
+            self.prev_twist = twist
+            self.last_solve_ok = True
+            self.last_solve_status = "solved"
+            self.last_solver = "direct"
+            return twist
+
+        c_mat = np.asarray(linear_constraint_matrix, dtype=float)
+        if c_mat.ndim != 2 or c_mat.shape[1] != self.task_dim * self.horizon:
+            raise ValueError("linear_constraint_matrix 尺寸错误")
+        if linear_lower_bound is None or linear_upper_bound is None:
+            raise ValueError("使用约束QP时必须同时提供 linear_lower_bound / linear_upper_bound")
+        c_low = np.asarray(linear_lower_bound, dtype=float).reshape(-1)
+        c_up = np.asarray(linear_upper_bound, dtype=float).reshape(-1)
+        if c_low.shape[0] != c_mat.shape[0] or c_up.shape[0] != c_mat.shape[0]:
+            raise ValueError("约束上下界长度与 linear_constraint_matrix 行数不一致")
+        if np.any(c_low > c_up):
+            self.last_solve_ok = False
+            self.last_solve_status = "invalid_bounds"
+            self.last_solver = "osqp"
+            return np.zeros(self.task_dim, dtype=float)
+
+        if str(qp_solver).lower() != "osqp":
+            raise ValueError("当前仅支持 qp_solver='osqp'")
+        if osqp is None:
+            raise RuntimeError("未安装 osqp，无法启用约束QP")
+
+        # OSQP 形式: min 1/2 x^T P x + q^T x, s.t. l <= A x <= u
+        p = 0.5 * (H + H.T)
+        n = p.shape[0]
+        p = p + 1e-9 * np.identity(n)
+        q = -rhs
+        p_csc = sp.csc_matrix(np.triu(p))
+        a_csc = sp.csc_matrix(c_mat)
+        try:
+            res = self._solve_with_osqp_cached(p_csc, q, a_csc, c_low, c_up)
+        except Exception as exc:
+            self.last_solve_ok = False
+            self.last_solve_status = f"osqp_setup_error:{type(exc).__name__}"
+            self.last_solver = "osqp"
+            return np.zeros(self.task_dim, dtype=float)
+        status_val = int(getattr(res.info, "status_val", -1))
+        status_str = str(getattr(res.info, "status", "unknown"))
+        solved = status_val in (1, 2) and (res.x is not None)
+        self.last_solve_ok = bool(solved)
+        self.last_solve_status = status_str
+        self.last_solver = "osqp"
+        if not solved:
+            return np.zeros(self.task_dim, dtype=float)
+
+        sol = np.asarray(res.x, dtype=float).reshape(-1)
+        self.full_solution = sol
+        twist = sol[: self.task_dim]
         self.prev_twist = twist
         return twist
 
@@ -220,9 +338,20 @@ class MPCController:
         phase_instant_attack: bool = True,
         use_offset_tracking: bool = False,
         offset_y: float = -0.1,
+        offset_release_time_s: float = 0.25,
+        hold_pos_weight_scale: float = 1.0,
+        attach_pos_weight_scale: float = 1.0,
+        hold_x_error_gain: float = 1.0,
+        attach_x_error_gain: float = 1.0,
+        hold_orientation_gain: float = 1.0,
+        attach_orientation_gain: float = 1.0,
         offset_trigger_tol: float = 0.02,
         offset_trigger_steps: int = 10,
         offset_trigger_hold_time_s: float = 0.5,
+        offset_switch_x_gate_enable: bool = False,
+        offset_switch_x_front: float = 0.2,
+        offset_switch_x_align_tol: float = 0.04,
+        offset_switch_yz_tol: float = 0.10,
         enable_grasp: bool = True,
         grasp_tol: float = 0.03,
         grasp_hold_steps: int = 3,
@@ -239,14 +368,17 @@ class MPCController:
         manipulability_grad_clip: float = 2.0,
         manipulability_horizon_decay: float = 0.8,
         manipulability_first_step_only: bool = False,
-        enable_funnel_constraint: bool = True,
-        funnel_depth: float = 0.10,
-        funnel_half_width: float = 0.05,
-        funnel_margin: float = 1e-3,
-        visualize_funnel_zone: bool = True,
-        funnel_vis_x_extent: float = 1.2,
-        funnel_vis_z_half: float = 1.0,
-        funnel_vis_rgba: Optional[np.ndarray] = None,
+        base_ff_gain: float = 1.0,
+        ee_linear_speed_limit: float = 0.8,
+        use_constrained_qp: bool = False,
+        qp_solver: str = "osqp",
+        qp_infeasible_policy: str = "hold",
+        qp_enforce_joint_pos: bool = True,
+        qp_enforce_joint_vel: bool = True,
+        qp_enforce_ee_x_upper: bool = False,
+        qp_ee_x_margin: float = 0.0,
+        qp_enforce_ee_y_upper: bool = False,
+        qp_ee_y_margin: float = 0.0,
     ):
         self.model = mujoco.MjModel.from_xml_path(model_xml)
         self.data = mujoco.MjData(self.model)
@@ -421,19 +553,32 @@ class MPCController:
         self._phase_last_enter_index = -1
         self._phase_x_hold_count = 0
         self._phase_last_x_err = np.nan
-        self._phase_last_front_ok = False
-        self._phase_last_front_y = np.nan
 
         # 侧向保持距离（y 偏置）→ 满足条件后切回原轨迹
         self.use_offset_tracking = bool(use_offset_tracking)
         self.offset_y = float(offset_y)
+        self.offset_release_time_s = max(0.0, float(offset_release_time_s))
+        self.hold_pos_weight_scale = max(1e-6, float(hold_pos_weight_scale))
+        self.attach_pos_weight_scale = max(1e-6, float(attach_pos_weight_scale))
+        self.hold_x_error_gain = max(1e-6, float(hold_x_error_gain))
+        self.attach_x_error_gain = max(1e-6, float(attach_x_error_gain))
+        self.hold_orientation_gain = float(hold_orientation_gain)
+        self.attach_orientation_gain = float(attach_orientation_gain)
         self.offset_trigger_tol = float(offset_trigger_tol)
         self.offset_trigger_steps = max(1, int(offset_trigger_steps))
         self.offset_trigger_hold_time_s = float(offset_trigger_hold_time_s)
+        self.offset_switch_x_gate_enable = bool(offset_switch_x_gate_enable)
+        self.offset_switch_x_front = max(0.0, float(offset_switch_x_front))
+        self.offset_switch_x_align_tol = max(0.0, float(offset_switch_x_align_tol))
+        self.offset_switch_yz_tol = max(0.0, float(offset_switch_yz_tol))
         self.offset_active = bool(use_offset_tracking)
         self._offset_hit_count = 0
         self._offset_last_dist = np.nan
         self._offset_time = 0.0
+        self._offset_release_start_time = np.nan
+        self._offset_x_gate_ready = False
+        self._offset_x_gate_threshold = np.nan
+        self._offset_x_gate_delta = np.nan
 
         # 过大的关节速度会导致“乱甩”，默认给一个更保守的上限；需要更激进可在外部调大
         self.velocity_limit = np.deg2rad(240.0) * np.ones(self.arm_dof)
@@ -454,9 +599,9 @@ class MPCController:
         # 平滑：在接近目标时保持足够反馈增益，避免 target_err 在 0.02m 附近“悬停”
         self.feedback_deadband = 0.005
         self.feedback_ramp = 0.03
-        self.base_ff_gain = 1.0
+        self.base_ff_gain = float(base_ff_gain)
         # 额外的任务空间限幅：避免 MPC 在大误差时给出过大的线速度，导致关节速度饱和→抖动
-        self.ee_linear_speed_limit = 0.8  # m/s
+        self.ee_linear_speed_limit = float(ee_linear_speed_limit)
 
         # 抓取检测（逻辑触发）
         self.enable_grasp = bool(enable_grasp)
@@ -469,23 +614,27 @@ class MPCController:
         self._grasp_time = 0.0
         self._attach_target = False
 
-        # 漏斗约束: 在目标前方 [y_t-depth, y_t] 里，仅允许 x 落在 [x_t-half_width, x_t+half_width]
-        self.enable_funnel_constraint = bool(enable_funnel_constraint)
-        self.funnel_depth = max(0.0, float(funnel_depth))
-        self.funnel_half_width = max(1e-6, float(funnel_half_width))
-        self.funnel_margin = max(1e-6, float(funnel_margin))
-        self._funnel_target_adjust_count = 0
-        self._funnel_twist_adjust_count = 0
-        self.visualize_funnel_zone = bool(visualize_funnel_zone)
-        self.funnel_vis_x_extent = max(0.05, float(funnel_vis_x_extent))
-        self.funnel_vis_z_half = max(0.05, float(funnel_vis_z_half))
-        if funnel_vis_rgba is None:
-            self.funnel_vis_rgba = np.array([1.0, 0.95, 0.45, 0.20], dtype=np.float32)
-        else:
-            rgba = np.asarray(funnel_vis_rgba, dtype=np.float32).reshape(-1)
-            if rgba.size != 4:
-                raise ValueError("funnel_vis_rgba 需要 4 维 RGBA")
-            self.funnel_vis_rgba = np.clip(rgba, 0.0, 1.0)
+        # 约束QP选项（默认关闭，保持兼容）
+        self.use_constrained_qp = bool(use_constrained_qp)
+        self.qp_solver = str(qp_solver).lower()
+        if self.use_constrained_qp and self.qp_solver != "osqp":
+            raise ValueError("use_constrained_qp=True 时仅支持 qp_solver='osqp'")
+        if self.use_constrained_qp and osqp is None:
+            raise RuntimeError("use_constrained_qp=True 需要安装 osqp")
+        self.qp_infeasible_policy = str(qp_infeasible_policy).lower()
+        if self.qp_infeasible_policy not in ("hold",):
+            raise ValueError("qp_infeasible_policy 仅支持 'hold'")
+        self.qp_enforce_joint_pos = bool(qp_enforce_joint_pos)
+        self.qp_enforce_joint_vel = bool(qp_enforce_joint_vel)
+        self.qp_enforce_ee_x_upper = bool(qp_enforce_ee_x_upper)
+        self.qp_ee_x_margin = float(qp_ee_x_margin)
+        self.qp_enforce_ee_y_upper = bool(qp_enforce_ee_y_upper)
+        self.qp_ee_y_margin = float(qp_ee_y_margin)
+        self._qp_last_warn_time = -np.inf
+        # 约束QP近目标降速（默认关闭，避免牺牲末端收敛精度；可按需调大开启）
+        self.qp_near_err = 0.0
+        self.qp_stop_err = 0.0
+        self.qp_min_qdot_scale = 0.30
 
     def _limit_twist_cmd(
         self, twist_cmd: np.ndarray, twist_fb: np.ndarray
@@ -517,13 +666,25 @@ class MPCController:
         ee_axis_world = self._approach_axis_world() if self.use_orientation_task else None
         if abs_time is None:
             abs_time = float(self.data.time)
+        if self.use_offset_tracking:
+            alpha = self._offset_release_progress(abs_time)
+            orientation_gain = float(
+                (1.0 - alpha) * self.hold_orientation_gain + alpha * self.attach_orientation_gain
+            )
+            x_error_gain = float(
+                (1.0 - alpha) * self.hold_x_error_gain + alpha * self.attach_x_error_gain
+            )
+        else:
+            orientation_gain = 1.0
+            x_error_gain = 1.0
         for i, desired in enumerate(future_targets):
             idx = i * self.mpc.task_dim
             e_hat[idx : idx + 3] = desired - current_pos
+            e_hat[idx] = x_error_gain * e_hat[idx]
             if self.use_orientation_task and ee_axis_world is not None:
                 desired_abs_time = float(abs_time) + self.preview_lead + (i + 1) * self.control_dt
                 desired_dir = self._desired_approach_dir(desired, desired_abs_time)
-                e_hat[idx + 3 : idx + 6] = np.cross(ee_axis_world, desired_dir)
+                e_hat[idx + 3 : idx + 6] = orientation_gain * np.cross(ee_axis_world, desired_dir)
         return e_hat
 
     def _task_jacobian(self) -> np.ndarray:
@@ -546,179 +707,6 @@ class MPCController:
             return target_world
         return mount_pos_world + (self.reach_max / dist) * vec
 
-    def _funnel_anchor_world(
-        self, sim_time: float, future_targets: Optional[np.ndarray] = None
-    ) -> np.ndarray:
-        if self.is_ball_rel and hasattr(self.trajectory, "ball_world"):
-            return np.asarray(self.trajectory.ball_world, dtype=float).reshape(3)
-        if future_targets is not None and future_targets.shape[0] > 0:
-            return np.asarray(future_targets[-1], dtype=float).reshape(3)
-        return np.asarray(self._world_target(sim_time), dtype=float).reshape(3)
-
-    def _funnel_bounds(self, target_world: np.ndarray) -> tuple[float, float, float, float]:
-        x_t = float(target_world[0])
-        y_t = float(target_world[1])
-        return (
-            x_t - self.funnel_half_width,
-            x_t + self.funnel_half_width,
-            y_t - self.funnel_depth,
-            y_t,
-        )
-
-    def _is_forbidden_by_funnel(self, pos_world: np.ndarray, target_world: np.ndarray) -> bool:
-        if (not self.enable_funnel_constraint) or self.funnel_depth <= 0.0:
-            return False
-        return self._is_in_funnel_geometry(pos_world, target_world)
-
-    def _is_in_funnel_geometry(self, pos_world: np.ndarray, target_world: np.ndarray) -> bool:
-        """纯几何判定（忽略 enable_funnel_constraint 开关），用于实验统计。"""
-        if self.funnel_depth <= 0.0:
-            return False
-        x = float(pos_world[0])
-        y = float(pos_world[1])
-        x_l, x_r, y_l, y_h = self._funnel_bounds(target_world)
-        if y < y_l or y > y_h:
-            return False
-        return (x <= x_l) or (x >= x_r)
-
-    def _arm_keypoints_world(self) -> np.ndarray:
-        """机械臂关键点（6个关节体位置 + 末端site）世界坐标。"""
-        joint_pts = self.data.xpos[self.arm_joint_body_ids].copy()
-        ee_pt = self.data.site_xpos[self.ee_site_id].reshape(1, 3).copy()
-        return np.vstack([joint_pts, ee_pt])
-
-    def _arm_any_in_funnel_geometry(self, target_world: np.ndarray) -> bool:
-        points = self._arm_keypoints_world()
-        for p in points:
-            if self._is_in_funnel_geometry(p, target_world):
-                return True
-        return False
-
-    def _project_out_of_funnel(self, pos_world: np.ndarray, target_world: np.ndarray) -> tuple[np.ndarray, bool]:
-        """若点落入禁区，投影到最近可行边界（离散安全层）。"""
-        p = np.asarray(pos_world, dtype=float).reshape(3)
-        if not self._is_forbidden_by_funnel(p, target_world):
-            return p, False
-
-        x_l, x_r, y_l, y_h = self._funnel_bounds(target_world)
-        eps = self.funnel_margin
-        x_inner_l = x_l + eps
-        x_inner_r = x_r - eps
-        if x_inner_r <= x_inner_l:
-            mid = 0.5 * (x_l + x_r)
-            x_inner_l = mid - 1e-6
-            x_inner_r = mid + 1e-6
-
-        candidates = []
-        c_back = p.copy()
-        c_back[1] = y_l - eps
-        candidates.append(c_back)
-
-        c_front = p.copy()
-        c_front[1] = y_h + eps
-        candidates.append(c_front)
-
-        c_corridor = p.copy()
-        c_corridor[0] = np.clip(c_corridor[0], x_inner_l, x_inner_r)
-        candidates.append(c_corridor)
-
-        dists = [float(np.linalg.norm(c - p)) for c in candidates]
-        best = candidates[int(np.argmin(dists))]
-        return best, True
-
-    def _apply_funnel_to_future_targets(
-        self, future_targets: np.ndarray, target_world: np.ndarray
-    ) -> np.ndarray:
-        if (not self.enable_funnel_constraint) or future_targets.size == 0:
-            return future_targets
-        adjusted = np.asarray(future_targets, dtype=float).copy()
-        changed = 0
-        for i in range(adjusted.shape[0]):
-            p_new, is_changed = self._project_out_of_funnel(adjusted[i], target_world)
-            adjusted[i] = p_new
-            changed += int(is_changed)
-        if changed > 0:
-            self._funnel_target_adjust_count += int(changed)
-        return adjusted
-
-    def _apply_funnel_to_twist(
-        self,
-        current_pos_world: np.ndarray,
-        target_world: np.ndarray,
-        twist_cmd: np.ndarray,
-        twist_fb: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        if not self.enable_funnel_constraint:
-            return twist_cmd, twist_fb
-
-        twist_cmd_out = np.asarray(twist_cmd, dtype=float).copy()
-        twist_fb_out = np.asarray(twist_fb, dtype=float).copy()
-        lin_cmd = twist_cmd_out[:3] if self.use_orientation_task else twist_cmd_out
-        next_pos = np.asarray(current_pos_world, dtype=float).reshape(3) + lin_cmd * self.control_dt
-        next_safe, changed = self._project_out_of_funnel(next_pos, target_world)
-        if not changed:
-            return twist_cmd_out, twist_fb_out
-
-        safe_lin = (next_safe - current_pos_world) / max(self.control_dt, 1e-9)
-        if self.use_orientation_task:
-            delta = safe_lin - twist_cmd_out[:3]
-            twist_cmd_out[:3] = safe_lin
-            twist_fb_out[:3] = twist_fb_out[:3] + delta
-        else:
-            delta = safe_lin - twist_cmd_out
-            twist_cmd_out = safe_lin
-            twist_fb_out = twist_fb_out + delta
-        self._funnel_twist_adjust_count += 1
-        return twist_cmd_out, twist_fb_out
-
-    def _draw_funnel_marker(self, viewer, target_world: np.ndarray) -> None:
-        """在 viewer 中绘制漏斗禁区（纯可视化，不参与碰撞）。"""
-        if (not self.enable_funnel_constraint) or (not self.visualize_funnel_zone):
-            return
-        if viewer is None:
-            return
-        if not hasattr(viewer, "user_scn"):
-            return
-
-        x_t, y_t, z_t = [float(v) for v in np.asarray(target_world, dtype=float).reshape(3)]
-        x_l = x_t - self.funnel_half_width
-        x_r = x_t + self.funnel_half_width
-        y_center = y_t - 0.5 * self.funnel_depth
-        y_half = 0.5 * self.funnel_depth
-        eps = self.funnel_margin
-        x_extent = self.funnel_vis_x_extent
-
-        left_half_x = max(0.01, x_extent)
-        right_half_x = max(0.01, x_extent)
-        left_center_x = x_l - left_half_x - eps
-        right_center_x = x_r + right_half_x + eps
-
-        # 两个禁区盒: 左侧和右侧（中间通道留空）
-        boxes = [
-            (np.array([left_center_x, y_center, z_t], dtype=np.float64),
-             np.array([left_half_x, y_half, self.funnel_vis_z_half], dtype=np.float32)),
-            (np.array([right_center_x, y_center, z_t], dtype=np.float64),
-             np.array([right_half_x, y_half, self.funnel_vis_z_half], dtype=np.float32)),
-        ]
-
-        mat = np.eye(3, dtype=np.float32).reshape(-1)
-        rgba = self.funnel_vis_rgba.copy()
-        with viewer.lock():
-            scn = viewer.user_scn
-            scn.ngeom = 0
-            for pos, size in boxes:
-                if scn.ngeom >= len(scn.geoms):
-                    break
-                mujoco.mjv_initGeom(
-                    scn.geoms[scn.ngeom],
-                    type=mujoco.mjtGeom.mjGEOM_BOX,
-                    size=size,
-                    pos=pos,
-                    mat=mat,
-                    rgba=rgba,
-                )
-                scn.ngeom += 1
-
     def _limit_joint_accel(self, qdot_cmd: np.ndarray, qdot_prev: np.ndarray, dt: float) -> np.ndarray:
         if dt <= 0:
             return qdot_cmd
@@ -727,10 +715,174 @@ class MPCController:
         delta = np.clip(delta, -max_delta, max_delta)
         return qdot_prev + delta
 
+    def _qp_task_to_joint_step_map(self, jac_pinv: np.ndarray) -> np.ndarray:
+        if self.use_orientation_task:
+            step_map = np.asarray(jac_pinv, dtype=float)
+            if step_map.shape != (self.arm_dof, self.mpc.task_dim):
+                raise ValueError("jac_pinv 维度错误（姿态任务）")
+            return step_map
+
+        step_map = np.zeros((self.arm_dof, self.mpc.task_dim), dtype=float)
+        jac_lin = np.asarray(jac_pinv, dtype=float)
+        if jac_lin.shape != (self.arm_dof, 3):
+            raise ValueError("jac_pinv 维度错误（位置任务）")
+        step_map[:, :3] = jac_lin
+        return step_map
+
+    def _build_constrained_qp_bounds(
+        self,
+        *,
+        jac_pinv: np.ndarray,
+        q_ref: np.ndarray,
+        current_pos_world: Optional[np.ndarray] = None,
+        ee_x_upper_seq: Optional[np.ndarray] = None,
+        ee_y_upper_seq: Optional[np.ndarray] = None,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        if not self.use_constrained_qp:
+            return None, None, None
+
+        a_blocks = []
+        l_blocks = []
+        u_blocks = []
+
+        if self.qp_enforce_joint_pos or self.qp_enforce_joint_vel:
+            step_map = self._qp_task_to_joint_step_map(jac_pinv)
+            a_qdot = np.kron(np.identity(self.mpc.horizon), step_map)
+
+            if self.qp_enforce_joint_vel:
+                vel = np.tile(self.velocity_limit, self.mpc.horizon)
+                a_blocks.append(a_qdot)
+                l_blocks.append(-vel)
+                u_blocks.append(vel)
+
+            if self.qp_enforce_joint_pos:
+                tril = np.tril(np.ones((self.mpc.horizon, self.mpc.horizon)))
+                integ = np.kron(tril, np.identity(self.arm_dof))
+                a_qpos = self.control_dt * (integ @ a_qdot)
+                q_ref = np.asarray(q_ref, dtype=float).reshape(self.arm_dof)
+                q_ref_stack = np.tile(q_ref, self.mpc.horizon)
+                l_qpos = np.tile(self.arm_qpos_min, self.mpc.horizon) - q_ref_stack
+                u_qpos = np.tile(self.arm_qpos_max, self.mpc.horizon) - q_ref_stack
+                a_blocks.append(a_qpos)
+                l_blocks.append(l_qpos)
+                u_blocks.append(u_qpos)
+
+        if self.qp_enforce_ee_x_upper:
+            if current_pos_world is None or ee_x_upper_seq is None:
+                raise ValueError("启用末端 x 上界约束时必须提供 current_pos_world / ee_x_upper_seq")
+            ee_x_upper_seq = np.asarray(ee_x_upper_seq, dtype=float).reshape(-1)
+            if ee_x_upper_seq.shape[0] != self.mpc.horizon:
+                raise ValueError("ee_x_upper_seq 长度必须等于 horizon")
+            a_ee_x = self.mpc.x_prediction_matrix.copy()
+            current_x = float(np.asarray(current_pos_world, dtype=float).reshape(3)[0])
+            l_ee_x = np.full(self.mpc.horizon, -np.inf, dtype=float)
+            u_ee_x = ee_x_upper_seq - current_x
+            a_blocks.append(a_ee_x)
+            l_blocks.append(l_ee_x)
+            u_blocks.append(u_ee_x)
+
+        if self.qp_enforce_ee_y_upper:
+            if current_pos_world is None or ee_y_upper_seq is None:
+                raise ValueError("启用末端 y 上界约束时必须提供 current_pos_world / ee_y_upper_seq")
+            ee_y_upper_seq = np.asarray(ee_y_upper_seq, dtype=float).reshape(-1)
+            if ee_y_upper_seq.shape[0] != self.mpc.horizon:
+                raise ValueError("ee_y_upper_seq 长度必须等于 horizon")
+            a_ee_y = self.mpc.y_prediction_matrix.copy()
+            current_y = float(np.asarray(current_pos_world, dtype=float).reshape(3)[1])
+            l_ee_y = np.full(self.mpc.horizon, -np.inf, dtype=float)
+            u_ee_y = ee_y_upper_seq - current_y
+            a_blocks.append(a_ee_y)
+            l_blocks.append(l_ee_y)
+            u_blocks.append(u_ee_y)
+
+        if len(a_blocks) == 0:
+            return None, None, None
+        return np.vstack(a_blocks), np.concatenate(l_blocks), np.concatenate(u_blocks)
+
+    def _qp_ee_x_upper_sequence(
+        self,
+        *,
+        sim_time: float,
+        target_world_now: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        margin = float(self.qp_ee_x_margin)
+        if target_world_now is not None:
+            x_now = float(np.asarray(target_world_now, dtype=float).reshape(3)[0]) + margin
+            return np.full(self.mpc.horizon, x_now, dtype=float)
+        future_world = self._world_future_targets(sim_time)
+        return np.asarray(future_world[:, 0], dtype=float).reshape(self.mpc.horizon) + margin
+
+    def _qp_ee_y_upper_sequence(
+        self,
+        *,
+        sim_time: float,
+        target_world_now: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        margin = float(self.qp_ee_y_margin)
+        if target_world_now is not None:
+            y_now = float(np.asarray(target_world_now, dtype=float).reshape(3)[1]) - margin
+            return np.full(self.mpc.horizon, y_now, dtype=float)
+        future_world = self._world_future_targets(sim_time)
+        return np.asarray(future_world[:, 1], dtype=float).reshape(self.mpc.horizon) - margin
+
+    def _log_qp_infeasible(self, sim_time: float) -> None:
+        if float(sim_time) - float(self._qp_last_warn_time) < 0.2:
+            return
+        self._qp_last_warn_time = float(sim_time)
+        print(
+            f"[qp] infeasible at t={float(self.data.time):.2f}s "
+            f"(status={self.mpc.last_solve_status}), apply hold"
+        )
+
+    def _qp_qdot_scale(self, active_err: float) -> float:
+        err = float(max(0.0, active_err))
+        if err <= self.qp_stop_err:
+            return self.qp_min_qdot_scale
+        if err >= self.qp_near_err:
+            return 1.0
+        alpha = (err - self.qp_stop_err) / max(self.qp_near_err - self.qp_stop_err, 1e-9)
+        return float(self.qp_min_qdot_scale + (1.0 - self.qp_min_qdot_scale) * alpha)
+
     def _feedback_gain(self, pos_err: float) -> float:
         if pos_err <= self.feedback_deadband:
             return 0.0
         return float(np.clip((pos_err - self.feedback_deadband) / self.feedback_ramp, 0.0, 1.0))
+
+    def _project_qdot_to_axis_upper(
+        self,
+        qdot_cmd: np.ndarray,
+        *,
+        jac_axis_row: np.ndarray,
+        current_value: float,
+        upper_value: float,
+    ) -> np.ndarray:
+        a = np.asarray(jac_axis_row, dtype=float).reshape(self.arm_dof)
+        denom = float(a @ a)
+        if denom < 1e-12 or self.control_dt <= 1e-12:
+            return qdot_cmd
+        b = (float(upper_value) - float(current_value)) / self.control_dt
+        violation = float(a @ qdot_cmd) - b
+        if violation <= 1e-9:
+            return qdot_cmd
+        qdot_proj = np.asarray(qdot_cmd, dtype=float).reshape(self.arm_dof) - (violation / denom) * a
+        return np.clip(qdot_proj, -self.velocity_limit, self.velocity_limit)
+
+    def _offset_y_at(self, abs_time: float) -> float:
+        if (not self.use_offset_tracking) or abs(self.offset_y) < 1e-12:
+            return 0.0
+        return float((1.0 - self._offset_release_progress(abs_time)) * self.offset_y)
+
+    def _offset_release_progress(self, abs_time: float) -> float:
+        if (not self.use_offset_tracking) or abs(self.offset_y) < 1e-12:
+            return 1.0
+        if self.offset_active:
+            return 0.0
+        if self.offset_release_time_s <= 1e-9:
+            return 1.0
+        if not np.isfinite(self._offset_release_start_time):
+            return 1.0
+        alpha = (float(abs_time) - float(self._offset_release_start_time)) / self.offset_release_time_s
+        return float(np.clip(alpha, 0.0, 1.0))
 
     def _parse_approach_axis(self, axis: Union[str, np.ndarray]) -> np.ndarray:
         if isinstance(axis, str):
@@ -761,6 +913,35 @@ class MPCController:
         sync = getattr(self.base_traj_for_rel, "sync", None)
         if callable(sync):
             sync(abs_time)
+
+    def _ball_rel_traj_time(self, sim_time: float, abs_time: float) -> float:
+        return float(sim_time) if self.use_offset_tracking else float(abs_time)
+
+    def _ball_rel_target_world(self, traj_time: float) -> np.ndarray:
+        if (not self.is_ball_rel) or (self.base_traj_for_rel is None):
+            raise ValueError("ball_in_robot 目标恢复需要有效的 base_trajectory")
+        self._sync_base_traj(traj_time)
+        target_rel = np.asarray(self.trajectory.position(traj_time), dtype=float).reshape(3)
+        base_pos = np.asarray(self.base_traj_for_rel.position(traj_time), dtype=float).reshape(3)
+        return target_rel + base_pos
+
+    def _ball_rel_future_targets_world(self, traj_time: float) -> np.ndarray:
+        if (not self.is_ball_rel) or (self.base_traj_for_rel is None):
+            raise ValueError("ball_in_robot 未来参考恢复需要有效的 base_trajectory")
+        self._sync_base_traj(traj_time)
+        rel_future = np.asarray(
+            self.trajectory.future_positions(
+                traj_time + self.preview_lead, self.mpc.horizon, self.control_dt
+            ),
+            dtype=float,
+        ).reshape(self.mpc.horizon, 3)
+        base_future = np.asarray(
+            self.base_traj_for_rel.future_positions(
+                traj_time + self.preview_lead, self.mpc.horizon, self.control_dt
+            ),
+            dtype=float,
+        ).reshape(self.mpc.horizon, 3)
+        return rel_future + base_future
 
     def _desired_approach_dir(self, target_world: np.ndarray, abs_time: float) -> np.ndarray:
         if self.terminal_approach_dir is not None:
@@ -822,30 +1003,78 @@ class MPCController:
         p1 = self.base_traj_for_rel.position(abs_time + self.control_dt)
         return (p1 - p0) / self.control_dt
 
-    def _future_pos_weight_scales(self, abs_time: float) -> Optional[np.ndarray]:
-        if not self.use_uncertainty_aware_weighting:
-            return None
+    def _base_stop_time(self) -> float:
         if (not self.is_ball_rel) or (self.base_traj_for_rel is None):
-            return None
+            return np.nan
+        duration = getattr(self.base_traj_for_rel, "duration", None)
+        if callable(duration):
+            try:
+                return float(duration())
+            except Exception:
+                return np.nan
+        return np.nan
+
+    def _future_with_base_drift_comp(
+        self, future_world: np.ndarray, abs_time: float
+    ) -> np.ndarray:
+        """
+        约束QP的参考补偿：在保持“在线QP硬约束”框架不变的前提下，
+        通过参考前移抵消底盘平移扰动，缓解“底盘未停时末端贴不住目标”。
+        """
+        if (not self.is_ball_rel) or (self.base_traj_for_rel is None):
+            return future_world
+        if self.use_pregrasp:
+            return future_world
+        phase_gain = 1.0
+        if self.use_offset_tracking:
+            phase_gain = self._offset_release_progress(abs_time)
+        if phase_gain <= 1e-9:
+            return future_world
+        self._sync_base_traj(abs_time)
+        base_now = self.base_traj_for_rel.position(abs_time)
+        base_future = self.base_traj_for_rel.future_positions(
+            abs_time + self.preview_lead,
+            self.mpc.horizon,
+            self.control_dt,
+        )
+        drift = base_future - base_now.reshape(1, 3)
+        return np.asarray(future_world, dtype=float) - (phase_gain * self.base_ff_gain) * drift
+
+    def _future_pos_weight_scales(self, abs_time: float) -> Optional[np.ndarray]:
+        if self.use_offset_tracking:
+            alpha = self._offset_release_progress(abs_time)
+            phase_scale = float(
+                (1.0 - alpha) * self.hold_pos_weight_scale + alpha * self.attach_pos_weight_scale
+            )
+        else:
+            phase_scale = 1.0
+
+        scales = np.full(self.mpc.horizon, float(phase_scale), dtype=float)
+
+        if not self.use_uncertainty_aware_weighting:
+            return None if np.allclose(scales, 1.0) else scales
+        if (not self.is_ball_rel) or (self.base_traj_for_rel is None):
+            return None if np.allclose(scales, 1.0) else scales
         cov_fn = getattr(self.base_traj_for_rel, "future_covariances_xy", None)
         if not callable(cov_fn):
-            return None
+            return None if np.allclose(scales, 1.0) else scales
         self._sync_base_traj(abs_time)
         covs = cov_fn(self.mpc.horizon, self.control_dt)
         covs = np.asarray(covs, dtype=float)
         if covs.shape != (self.mpc.horizon, 2, 2):
-            return None
+            return None if np.allclose(scales, 1.0) else scales
         traces = np.clip(np.trace(covs, axis1=1, axis2=2), 0.0, None)
         sigma = np.sqrt(traces)
-        scales = np.exp(-self.uncertainty_beta * sigma)
-        scales = np.clip(scales, self.uncertainty_min_scale, 1.0)
+        uncertainty_scales = np.exp(-self.uncertainty_beta * sigma)
+        uncertainty_scales = np.clip(uncertainty_scales, self.uncertainty_min_scale, 1.0)
         if self.uncertainty_ema > 1e-9:
-            scales = (
+            uncertainty_scales = (
                 self.uncertainty_ema * self._uncertainty_scales_last
-                + (1.0 - self.uncertainty_ema) * scales
+                + (1.0 - self.uncertainty_ema) * uncertainty_scales
             )
         self._uncertainty_sigma_last = sigma
-        self._uncertainty_scales_last = scales
+        self._uncertainty_scales_last = uncertainty_scales
+        scales = scales * uncertainty_scales
         return scales
 
     def _manipulability_value_from_jac_pos(self, jac_pos: np.ndarray) -> float:
@@ -921,20 +1150,29 @@ class MPCController:
         return rhs
 
     def _control_target_world(self, sim_time: float, abs_time: float) -> np.ndarray:
-        # 两阶段偏置模式下，直接使用真实目标/偏置目标，不做 reach clamp。
+        # hold 阶段保留可达裁剪，避免长时间追踪不可达前置点导致抖动；
+        # attach 阶段直接追原相对轨迹恢复的参考，避免“已经到目标附近但仍被可达裁剪点卡住”。
         if self.is_ball_rel and self.use_offset_tracking:
-            target = np.asarray(self.trajectory.ball_world, dtype=float).reshape(3)
-            if self.offset_active:
-                target = target + np.array([0.0, self.offset_y, 0.0], dtype=float)
-            return target
+            traj_time = self._ball_rel_traj_time(sim_time, abs_time)
+            attach_target = self._ball_rel_target_world(traj_time)
+            hold_target = attach_target + np.array([0.0, self.offset_y, 0.0], dtype=float)
+            hold_target_clipped = hold_target.copy()
+            if self.base_traj_for_rel is not None:
+                self._sync_base_traj(traj_time)
+                base_pos = self.base_traj_for_rel.position(traj_time)
+                mount_pos = base_pos + self.shoulder_offset
+                hold_target_clipped = self._reachable_target(hold_target, mount_pos)
+            alpha = self._offset_release_progress(abs_time)
+            return (1.0 - alpha) * hold_target_clipped + alpha * attach_target
         if not self.is_ball_rel:
             return self._world_target(sim_time)
         if self.base_traj_for_rel is None:
-            return self.trajectory.ball_world
-        self._sync_base_traj(abs_time)
-        base_pos = self.base_traj_for_rel.position(abs_time)
+            return self._world_target(sim_time)
+        traj_time = self._ball_rel_traj_time(sim_time, abs_time)
+        self._sync_base_traj(traj_time)
+        base_pos = self.base_traj_for_rel.position(traj_time)
         mount_pos = base_pos + self.shoulder_offset
-        return self._reachable_target(self.trajectory.ball_world, mount_pos)
+        return self._reachable_target(self._ball_rel_target_world(traj_time), mount_pos)
 
     def _predict_opt_zone_entry_index(self, abs_time: float) -> Optional[int]:
         """
@@ -952,18 +1190,21 @@ class MPCController:
                 d[2] = 0.0
             return float(np.linalg.norm(d))
 
-        # ball_in_robot: 目标世界坐标固定，底盘未来轨迹可由 base_traj 直接外推。
-        if self.is_ball_rel and self.base_traj_for_rel is not None and hasattr(self.trajectory, "ball_world"):
+        # ball_in_robot: 只使用相对轨迹 + 底盘预测恢复世界系参考。
+        if self.is_ball_rel and self.base_traj_for_rel is not None:
             self._sync_base_traj(abs_time)
-            base_future = self.base_traj_for_rel.future_positions(
-                abs_time + self.preview_lead,
-                self.mpc.horizon,
-                self.control_dt,
-            )
-            target_world = np.asarray(self.trajectory.ball_world, dtype=float).reshape(3)
+            base_future = np.asarray(
+                self.base_traj_for_rel.future_positions(
+                    abs_time + self.preview_lead,
+                    self.mpc.horizon,
+                    self.control_dt,
+                ),
+                dtype=float,
+            ).reshape(self.mpc.horizon, 3)
+            target_future = self._ball_rel_future_targets_world(abs_time)
             for i in range(base_future.shape[0]):
                 shoulder_world = base_future[i] + self.shoulder_offset
-                dist = phase_distance(target_world, shoulder_world)
+                dist = phase_distance(target_future[i], shoulder_world)
                 if self.phase_opt_radius_min <= dist <= self.phase_opt_radius_max:
                     return int(i)
             return None
@@ -1016,14 +1257,7 @@ class MPCController:
             )
             x_err = abs(float(ee[0]) - float(tgt[0]))
             self._phase_last_x_err = float(x_err)
-            _, _, y_l, y_h = self._funnel_bounds(tgt)
-            y_now = float(ee[1])
-            in_front_band = (y_l - self.funnel_margin) <= y_now <= (y_h + self.funnel_margin)
-            outside_forbidden = not self._is_forbidden_by_funnel(ee, tgt)
-            front_ok = bool(in_front_band and outside_forbidden)
-            self._phase_last_front_ok = front_ok
-            self._phase_last_front_y = y_now
-            if x_err <= self.phase_x_gate_half_width and front_ok:
+            if x_err <= self.phase_x_gate_half_width:
                 self._phase_x_hold_count += 1
             else:
                 self._phase_x_hold_count = 0
@@ -1036,8 +1270,7 @@ class MPCController:
                     abs_time=abs_time,
                     reason=(
                         f"x_gate(|dx|={x_err:.4f}<= {self.phase_x_gate_half_width:.4f}, "
-                        f"hold={self.phase_x_gate_hold_steps}, "
-                        f"y_in=[{y_l:.3f},{y_h:.3f}], y={y_now:.3f})"
+                        f"hold={self.phase_x_gate_hold_steps})"
                     ),
                 )
             return
@@ -1069,22 +1302,56 @@ class MPCController:
         abs_time: float,
         current_pos_world: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        funnel_anchor = self._funnel_anchor_world(sim_time=sim_time)
-        # 两阶段偏置模式下，参考轨迹就是常值目标（hold: target+offset, attach: target）。
+        # 两阶段偏置模式下，hold: target+offset, attach: target。
+        # 仅 hold 阶段保留可达裁剪；attach 阶段直接给原相对轨迹恢复的参考，避免末端在目标附近悬停。
         if self.is_ball_rel and self.use_offset_tracking:
-            target = np.asarray(self.trajectory.ball_world, dtype=float).reshape(3)
-            if self.offset_active:
-                target = target + np.array([0.0, self.offset_y, 0.0], dtype=float)
-            future = np.tile(target, (self.mpc.horizon, 1))
-            return self._apply_funnel_to_future_targets(future, funnel_anchor)
+            traj_time = self._ball_rel_traj_time(sim_time, abs_time)
+            attach_future = self._ball_rel_future_targets_world(traj_time)
+            offset_vals = np.array(
+                [
+                    self._offset_y_at(
+                        float(abs_time) + self.preview_lead + (i + 1) * self.control_dt
+                    )
+                    for i in range(self.mpc.horizon)
+                ],
+                dtype=float,
+            ).reshape(self.mpc.horizon, 1)
+            hold_future = attach_future + np.hstack(
+                [
+                    np.zeros((self.mpc.horizon, 1), dtype=float),
+                    offset_vals,
+                    np.zeros((self.mpc.horizon, 1), dtype=float),
+                ]
+            )
+            hold_future_clipped = hold_future.copy()
+            if self.base_traj_for_rel is not None:
+                self._sync_base_traj(traj_time)
+                base_future = self.base_traj_for_rel.future_positions(
+                    traj_time + self.preview_lead,
+                    self.mpc.horizon,
+                    self.control_dt,
+                )
+                hold_future_clipped = np.zeros((self.mpc.horizon, 3), dtype=float)
+                for i in range(self.mpc.horizon):
+                    mount_pos = base_future[i] + self.shoulder_offset
+                    hold_future_clipped[i] = self._reachable_target(hold_future[i], mount_pos)
+            blend_vals = np.array(
+                [
+                    self._offset_release_progress(
+                        float(abs_time) + self.preview_lead + (i + 1) * self.control_dt
+                    )
+                    for i in range(self.mpc.horizon)
+                ],
+                dtype=float,
+            ).reshape(self.mpc.horizon, 1)
+            return (1.0 - blend_vals) * hold_future_clipped + blend_vals * attach_future
         if self.intercept_planner is not None and current_pos_world is not None:
-            future = self.intercept_planner.plan(
+            return self.intercept_planner.plan(
                 current_pos_world=current_pos_world,
                 abs_time=abs_time,
                 horizon=self.mpc.horizon,
                 control_dt=self.control_dt,
             )
-            return self._apply_funnel_to_future_targets(future, funnel_anchor)
         if self.use_pregrasp and self.is_ball_rel and self.base_traj_for_rel is not None:
             self._sync_base_traj(abs_time)
             enter_idx = None
@@ -1097,6 +1364,12 @@ class MPCController:
                 self.control_dt,
             )
             future = np.zeros((self.mpc.horizon, 3), dtype=float)
+            rel_future = np.asarray(
+                self.trajectory.future_positions(
+                    abs_time + self.preview_lead, self.mpc.horizon, self.control_dt
+                ),
+                dtype=float,
+            ).reshape(self.mpc.horizon, 3)
             for i in range(self.mpc.horizon):
                 base_pos = base_future[i]
                 t_abs = abs_time + self.preview_lead + (i + 1) * self.control_dt
@@ -1110,34 +1383,39 @@ class MPCController:
                     offset = (1.0 - alpha) * self.pregrasp_offset
                 else:
                     offset = self.pregrasp_offset
-                target_rel = self.trajectory.ball_world - base_pos
+                target_rel = rel_future[i]
                 desired_rel = target_rel - offset * self.pregrasp_dir
                 future[i] = desired_rel + base_pos
-            return self._apply_funnel_to_future_targets(future, funnel_anchor)
+            return future
         if not self.is_ball_rel:
             future = self._world_future_targets(sim_time)
-            if self.use_offset_tracking and self.offset_active:
-                future = future + np.array([0.0, self.offset_y, 0.0], dtype=float)
-            return self._apply_funnel_to_future_targets(future, funnel_anchor)
+            offset_y = self._offset_y_at(abs_time)
+            if abs(offset_y) > 1e-12:
+                future = future + np.array([0.0, offset_y, 0.0], dtype=float)
+            return future
         if self.base_traj_for_rel is None:
-            future = np.tile(self.trajectory.ball_world, (self.mpc.horizon, 1))
-            if self.use_offset_tracking and self.offset_active:
-                future = future + np.array([0.0, self.offset_y, 0.0], dtype=float)
-            return self._apply_funnel_to_future_targets(future, funnel_anchor)
-        self._sync_base_traj(abs_time)
+            future = self._world_future_targets(sim_time)
+            offset_y = self._offset_y_at(abs_time)
+            if abs(offset_y) > 1e-12:
+                future = future + np.array([0.0, offset_y, 0.0], dtype=float)
+            return future
+        traj_time = self._ball_rel_traj_time(sim_time, abs_time)
+        self._sync_base_traj(traj_time)
         base_future = self.base_traj_for_rel.future_positions(
-            abs_time + self.preview_lead,
+            traj_time + self.preview_lead,
             self.mpc.horizon,
             self.control_dt,
         )
+        target_future = self._ball_rel_future_targets_world(traj_time)
         future = np.zeros((self.mpc.horizon, 3), dtype=float)
         for i in range(self.mpc.horizon):
             base_pos = base_future[i]
             mount_pos = base_pos + self.shoulder_offset
-            future[i] = self._reachable_target(self.trajectory.ball_world, mount_pos)
-        if self.use_offset_tracking and self.offset_active:
-            future = future + np.array([0.0, self.offset_y, 0.0], dtype=float)
-        return self._apply_funnel_to_future_targets(future, funnel_anchor)
+            future[i] = self._reachable_target(target_future[i], mount_pos)
+        offset_y = self._offset_y_at(abs_time)
+        if abs(offset_y) > 1e-12:
+            future = future + np.array([0.0, offset_y, 0.0], dtype=float)
+        return future
 
     def _apply_joint_position(self, q_des: np.ndarray):
         if q_des.shape != (self.arm_dof,):
@@ -1147,8 +1425,10 @@ class MPCController:
 
     def _world_target(self, sim_time: float) -> np.ndarray:
         if self.is_ball_rel:
-            # ball_in_robot: 世界中小球静止，直接返回 ball_world
-            return self.trajectory.ball_world
+            # ball_in_robot: 通过相对轨迹 + 底盘预测恢复等价世界系参考。
+            if self.base_traj_for_rel is None:
+                return np.asarray(self.trajectory.position(sim_time), dtype=float).reshape(3)
+            return self._ball_rel_target_world(sim_time)
         base_origin = getattr(self.trajectory, "base_origin", None)
         if base_origin is not None:
             return self.trajectory.position(sim_time) + base_origin
@@ -1156,8 +1436,13 @@ class MPCController:
 
     def _world_future_targets(self, sim_time: float) -> np.ndarray:
         if self.is_ball_rel:
-            # 未来点也是同一个世界系位置
-            return np.tile(self.trajectory.ball_world, (self.mpc.horizon, 1))
+            # ball_in_robot: 未来参考同样由相对轨迹与底盘预测共同恢复。
+            if self.base_traj_for_rel is None:
+                rel_future = self.trajectory.future_positions(
+                    sim_time + self.preview_lead, self.mpc.horizon, self.control_dt
+                )
+                return np.asarray(rel_future, dtype=float).reshape(self.mpc.horizon, 3)
+            return self._ball_rel_future_targets_world(sim_time)
         future_rel = self.trajectory.future_positions(
             sim_time + self.preview_lead, self.mpc.horizon, self.control_dt
         )
@@ -1225,98 +1510,167 @@ class MPCController:
                     abs_time=abs_time,
                     current_pos_world=current_pos_world,
                 )
-                e_hat = self._task_error(current_pos, future_targets, abs_time=abs_time)
+                future_for_opt = (
+                    self._future_with_base_drift_comp(future_targets, abs_time=abs_time)
+                    if self.use_constrained_qp
+                    else future_targets
+                )
+                e_hat = self._task_error(current_pos, future_for_opt, abs_time=abs_time)
                 terminal_time = abs_time + self.preview_lead + self.mpc.horizon * self.control_dt
                 current_state, desired_state = self._terminal_state(
-                    current_pos, future_targets[-1], terminal_time
+                    current_pos, future_for_opt[-1], terminal_time
                 )
                 pos_weight_scales = self._future_pos_weight_scales(abs_time)
                 manip_rhs = self._manipulability_guidance_rhs()
-                twist = self.mpc.solve(
-                    e_hat,
-                    current_state=current_state,
-                    desired_terminal=desired_state,
-                    pos_weight_scales=pos_weight_scales,
-                    extra_rhs=manip_rhs,
-                )
 
                 jac_full = self._task_jacobian()
                 jac = jac_full if self.use_orientation_task else jac_full[:3]
                 jac_pinv = self._jacobian_pinv(jac)
-                cond_val = np.linalg.cond(jac @ jac.T)
-                if self.intercept_planner is not None:
-                    ball_err = float(np.linalg.norm(future_targets[0] - current_pos))
-                else:
-                    ball_err = float(np.linalg.norm(target_pos_world - current_pos))
-                fb_gain = self._feedback_gain(ball_err)
-
-                twist_fb = (twist.copy() if self.use_orientation_task else twist[:3].copy()) * fb_gain
-                twist_ff = np.zeros_like(twist_fb)
-                if (
-                    self.intercept_planner is None
-                    and (not self.use_offset_tracking)
-                    and self.is_ball_rel
-                    and self.base_traj_for_rel is not None
-                ):
-                    desired_now = self._control_target_world(sim_time=sim_time, abs_time=abs_time)
-                    desired_next = future_targets[0]
-                    desired_vel = (desired_next - desired_now) / self.control_dt
-                    base_vel = self._base_velocity_world(abs_time)
-                    ff_xyz = self.base_ff_gain * (desired_vel - base_vel)
-                    if self.use_orientation_task:
-                        twist_ff[:3] = ff_xyz
+                if self.use_constrained_qp:
+                    q_now = self.data.qpos[self.arm_qpos_indices].copy()
+                    ee_x_upper_seq = self._qp_ee_x_upper_sequence(
+                        sim_time=sim_time,
+                        target_world_now=target_pos_world,
+                    )
+                    ee_y_upper_seq = self._qp_ee_y_upper_sequence(
+                        sim_time=sim_time,
+                        target_world_now=target_pos_world,
+                    )
+                    a_cons, l_cons, u_cons = self._build_constrained_qp_bounds(
+                        jac_pinv=jac_pinv,
+                        q_ref=q_now,
+                        current_pos_world=current_pos_world,
+                        ee_x_upper_seq=ee_x_upper_seq,
+                        ee_y_upper_seq=ee_y_upper_seq,
+                    )
+                    twist = self.mpc.solve(
+                        e_hat,
+                        current_state=current_state,
+                        desired_terminal=desired_state,
+                        pos_weight_scales=pos_weight_scales,
+                        extra_rhs=manip_rhs,
+                        linear_constraint_matrix=a_cons,
+                        linear_lower_bound=l_cons,
+                        linear_upper_bound=u_cons,
+                        qp_solver=self.qp_solver,
+                    )
+                    if self.mpc.last_solve_ok:
+                        active_err = float(np.linalg.norm(future_targets[0] - current_pos))
+                        if self.use_offset_tracking and self.offset_active:
+                            qp_scale = 1.0
+                        else:
+                            qp_scale = self._qp_qdot_scale(active_err)
+                        if self.use_orientation_task:
+                            twist_cmd = twist.copy() * qp_scale
+                            self.mpc.prev_twist = twist_cmd.copy()
+                        else:
+                            twist_cmd = twist[:3].copy() * qp_scale
+                            self.mpc.prev_twist[:3] = twist_cmd
+                            self.mpc.prev_twist[3:] = 0.0
+                        qdot_raw = jac_pinv @ twist_cmd
+                        qdot_cmd = self._limit_joint_accel(qdot_raw, qdot_cmd, self.control_dt)
+                        if self.qp_enforce_joint_vel:
+                            qdot_cmd = np.clip(qdot_cmd, -self.velocity_limit, self.velocity_limit)
+                        if self.qp_enforce_ee_x_upper:
+                            qdot_cmd = self._project_qdot_to_axis_upper(
+                                qdot_cmd,
+                                jac_axis_row=jac_full[0],
+                                current_value=float(current_pos_world[0]),
+                                upper_value=float(ee_x_upper_seq[0]),
+                            )
+                        if self.qp_enforce_ee_y_upper:
+                            qdot_cmd = self._project_qdot_to_axis_upper(
+                                qdot_cmd,
+                                jac_axis_row=jac_full[1],
+                                current_value=float(current_pos_world[1]),
+                                upper_value=float(ee_y_upper_seq[0]),
+                            )
+                        q_des = q_now + qdot_cmd * self.control_dt
+                        if self.qp_enforce_joint_pos:
+                            q_des = np.clip(q_des, self.arm_qpos_min, self.arm_qpos_max)
                     else:
-                        twist_ff = ff_xyz
-                twist_cmd = twist_fb + twist_ff
-
-                if cond_val > self.cond_threshold:
-                    scale = np.clip(self.cond_threshold / cond_val, self.min_twist_scale, 1.0)
-                    twist_cmd = twist_cmd * scale
-                    twist_fb = twist_fb * scale
-                twist_cmd, twist_fb = self._limit_twist_cmd(twist_cmd, twist_fb)
-                funnel_anchor = self._funnel_anchor_world(sim_time=sim_time, future_targets=future_targets)
-                twist_cmd, twist_fb = self._apply_funnel_to_twist(
-                    current_pos_world=current_pos,
-                    target_world=funnel_anchor,
-                    twist_cmd=twist_cmd,
-                    twist_fb=twist_fb,
-                )
-
-                # 让 MPC 的内部状态与实际执行的 feedback 保持一致，避免 warm_start→control 的“带速”抖动
-                if self.use_orientation_task:
-                    self.mpc.prev_twist = twist_fb.copy()
+                        if self.qp_infeasible_policy == "hold":
+                            self._log_qp_infeasible(sim_time=float(sim_time))
+                            qdot_cmd = np.zeros(self.arm_dof, dtype=float)
+                            self.mpc.prev_twist[:] = 0.0
+                        else:
+                            raise RuntimeError(
+                                f"未支持的 qp_infeasible_policy={self.qp_infeasible_policy}"
+                            )
                 else:
-                    self.mpc.prev_twist[:3] = twist_fb
-                    self.mpc.prev_twist[3:] = 0.0
+                    cond_val = np.linalg.cond(jac @ jac.T)
+                    if self.intercept_planner is not None:
+                        ball_err = float(np.linalg.norm(future_targets[0] - current_pos))
+                    else:
+                        ball_err = float(np.linalg.norm(target_pos_world - current_pos))
+                    fb_gain = self._feedback_gain(ball_err)
 
-                qdot_task = jac_pinv @ twist_cmd
-                vel_ratio_task = np.max(np.abs(qdot_task) / self.velocity_limit)
-                task_budget = float(np.clip(1.0 - vel_ratio_task, 0.0, 1.0))
+                    twist = self.mpc.solve(
+                        e_hat,
+                        current_state=current_state,
+                        desired_terminal=desired_state,
+                        pos_weight_scales=pos_weight_scales,
+                        extra_rhs=manip_rhs,
+                    )
+                    twist_fb = (twist.copy() if self.use_orientation_task else twist[:3].copy()) * fb_gain
+                    twist_ff = np.zeros_like(twist_fb)
+                    if (
+                        self.intercept_planner is None
+                        and (not self.use_offset_tracking)
+                        and self.is_ball_rel
+                        and self.base_traj_for_rel is not None
+                    ):
+                        desired_now = self._control_target_world(sim_time=sim_time, abs_time=abs_time)
+                        desired_next = future_targets[0]
+                        desired_vel = (desired_next - desired_now) / self.control_dt
+                        base_vel = self._base_velocity_world(abs_time)
+                        ff_xyz = self.base_ff_gain * (desired_vel - base_vel)
+                        if self.use_orientation_task:
+                            twist_ff[:3] = ff_xyz
+                        else:
+                            twist_ff = ff_xyz
+                    twist_cmd = twist_fb + twist_ff
 
-                null_w = 1.0 / (1.0 + (ball_err / self.nullspace_err_scale) ** 2)
-                joint_offset = self.q_nominal - self.data.qpos[self.arm_qpos_indices]
-                dyn_gain = (self.nullspace_gain * null_w * task_budget) * (
-                    1.0 + np.clip(np.linalg.norm(joint_offset) / self.nullspace_scale, 0.0, 3.0)
-                )
-                nullspace_term = dyn_gain * joint_offset
-                qdot_cmd_raw = qdot_task + (
-                    (np.identity(self.arm_dof) - jac_pinv @ jac) @ nullspace_term
-                )
-                vel_ratio = np.max(np.abs(qdot_cmd_raw) / self.velocity_limit)
-                if vel_ratio > 1.0:
-                    qdot_cmd_raw = qdot_cmd_raw / vel_ratio
-                qdot_cmd = self._limit_joint_accel(qdot_cmd_raw, qdot_cmd, self.control_dt)
-                qdot_cmd = np.clip(qdot_cmd, -self.velocity_limit, self.velocity_limit)
-                joint_bias = self.drift_gain * joint_offset * self.control_dt
-                # position 伺服：用内部的 q_des 积分（而不是用当前 qpos），这样当机械臂跟不上时误差会累积，伺服会自动“加力追上”
-                q_des = q_des + qdot_cmd * self.control_dt + joint_bias
-                q_des = np.clip(q_des, self.arm_qpos_min, self.arm_qpos_max)
+                    if cond_val > self.cond_threshold:
+                        scale = np.clip(self.cond_threshold / cond_val, self.min_twist_scale, 1.0)
+                        twist_cmd = twist_cmd * scale
+                        twist_fb = twist_fb * scale
+                    twist_cmd, twist_fb = self._limit_twist_cmd(twist_cmd, twist_fb)
+
+                    # 让 MPC 的内部状态与实际执行的 feedback 保持一致，避免 warm_start→control 的“带速”抖动
+                    if self.use_orientation_task:
+                        self.mpc.prev_twist = twist_fb.copy()
+                    else:
+                        self.mpc.prev_twist[:3] = twist_fb
+                        self.mpc.prev_twist[3:] = 0.0
+
+                    qdot_task = jac_pinv @ twist_cmd
+                    vel_ratio_task = np.max(np.abs(qdot_task) / self.velocity_limit)
+                    task_budget = float(np.clip(1.0 - vel_ratio_task, 0.0, 1.0))
+
+                    null_w = 1.0 / (1.0 + (ball_err / self.nullspace_err_scale) ** 2)
+                    joint_offset = self.q_nominal - self.data.qpos[self.arm_qpos_indices]
+                    dyn_gain = (self.nullspace_gain * null_w * task_budget) * (
+                        1.0 + np.clip(np.linalg.norm(joint_offset) / self.nullspace_scale, 0.0, 3.0)
+                    )
+                    nullspace_term = dyn_gain * joint_offset
+                    qdot_cmd_raw = qdot_task + (
+                        (np.identity(self.arm_dof) - jac_pinv @ jac) @ nullspace_term
+                    )
+                    vel_ratio = np.max(np.abs(qdot_cmd_raw) / self.velocity_limit)
+                    if vel_ratio > 1.0:
+                        qdot_cmd_raw = qdot_cmd_raw / vel_ratio
+                    qdot_cmd = self._limit_joint_accel(qdot_cmd_raw, qdot_cmd, self.control_dt)
+                    qdot_cmd = np.clip(qdot_cmd, -self.velocity_limit, self.velocity_limit)
+                    joint_bias = self.drift_gain * joint_offset * self.control_dt
+                    # position 伺服：用内部的 q_des 积分（而不是用当前 qpos），这样当机械臂跟不上时误差会累积，伺服会自动“加力追上”
+                    q_des = q_des + qdot_cmd * self.control_dt + joint_bias
+                    q_des = np.clip(q_des, self.arm_qpos_min, self.arm_qpos_max)
 
             self._apply_joint_position(q_des)
 
             mujoco.mj_step(self.model, self.data)
             if viewer and (k % self.render_every == 0):
-                self._draw_funnel_marker(viewer, target_pos_world)
                 viewer.sync()
             last_dist = float(
                 np.linalg.norm(self.data.site_xpos[self.ee_site_id] - target_pos_world)
@@ -1348,6 +1702,7 @@ class MPCController:
         qdot_cmd = self.last_qdot_cmd.copy()
         q_des = self.data.qpos[self.arm_qpos_indices].copy()
         qdot_pre_clip = np.zeros_like(qdot_cmd)
+        cond_last = np.nan
         while True:
             step_start = time.time()
             sim_time = self.data.time - self.time_offset
@@ -1385,18 +1740,44 @@ class MPCController:
                 need_recompute_future = False
                 if self.use_offset_tracking and self.offset_active:
                     # 第一阶段: 跟踪 y 偏置轨迹；连续命中后切到原轨迹（第二阶段）。
-                    # 以“当前实际MPC跟踪参考点”计数，而不是原始target+offset，
-                    # 这样可与 reachable clamp / preview 完全一致，避免误判导致不切换。
-                    offset_target = future_world[0].copy()
-                    offset_dist = float(np.linalg.norm(current_pos_world - offset_target))
+                    # 切换判据：末端 x 到达阈值后，连续命中若干控制步再切换。
+                    hold_ref_switch = target_world_ref + np.array([0.0, self.offset_y, 0.0], dtype=float)
+                    offset_dist = float(np.linalg.norm(current_pos_world - hold_ref_switch))
                     self._offset_last_dist = offset_dist
-                    if offset_dist <= self.offset_trigger_tol:
+                    target_x = float(target_world_ref[0])
+                    x_gate_threshold = target_x - self.offset_switch_x_front
+                    if self.offset_switch_x_gate_enable:
+                        x_gate_ready = float(current_pos_world[0]) >= x_gate_threshold
+                    else:
+                        x_gate_ready = True
+                    self._offset_x_gate_ready = bool(x_gate_ready)
+                    self._offset_x_gate_threshold = float(x_gate_threshold)
+                    self._offset_x_gate_delta = float(current_pos_world[0] - x_gate_threshold)
+
+                    hold_ref_switch = target_world_ref + np.array(
+                        [0.0, self.offset_y, 0.0], dtype=float
+                    )
+                    x_align_err = abs(float(current_pos_world[0]) - float(hold_ref_switch[0]))
+                    yz_hold_err = float(
+                        np.linalg.norm(
+                            np.asarray(current_pos_world[1:3], dtype=float)
+                            - np.asarray(hold_ref_switch[1:3], dtype=float)
+                        )
+                    )
+                    hold_ready = x_gate_ready
+                    if self.offset_switch_x_align_tol > 1e-9:
+                        hold_ready = hold_ready and (x_align_err <= self.offset_switch_x_align_tol)
+                    if self.offset_switch_yz_tol > 1e-9:
+                        hold_ready = hold_ready and (yz_hold_err <= self.offset_switch_yz_tol)
+
+                    if hold_ready:
                         self._offset_hit_count += 1
                     else:
                         self._offset_hit_count = 0
 
                     if self._offset_hit_count >= self.offset_trigger_steps:
                         self.offset_active = False
+                        self._offset_release_start_time = float(self.data.time)
                         self._offset_hit_count = 0
                         need_recompute_future = True
 
@@ -1416,97 +1797,176 @@ class MPCController:
                         abs_time=self.data.time,
                         current_pos_world=current_pos_world,
                     )
-                e_hat = self._task_error(current_pos, future_world, abs_time=float(self.data.time))
+                future_for_opt = (
+                    self._future_with_base_drift_comp(future_world, abs_time=float(self.data.time))
+                    if self.use_constrained_qp
+                    else future_world
+                )
+                e_hat = self._task_error(current_pos, future_for_opt, abs_time=float(self.data.time))
 
                 terminal_time = (
                     self.data.time + self.preview_lead + self.mpc.horizon * self.control_dt
                 )
                 current_state, desired_state = self._terminal_state(
-                    current_pos, future_world[-1], terminal_time
+                    current_pos, future_for_opt[-1], terminal_time
                 )
                 pos_weight_scales = self._future_pos_weight_scales(float(self.data.time))
                 manip_rhs = self._manipulability_guidance_rhs()
-                twist = self.mpc.solve(
-                    e_hat,
-                    current_state=current_state,
-                    desired_terminal=desired_state,
-                    pos_weight_scales=pos_weight_scales,
-                    extra_rhs=manip_rhs,
-                )
                 jac_full = self._task_jacobian()
                 jac = jac_full if self.use_orientation_task else jac_full[:3]
                 jac_pinv = self._jacobian_pinv(jac)
-
                 cond_val = np.linalg.cond(jac @ jac.T)
-                if self.intercept_planner is not None or self.use_pregrasp or self.use_offset_tracking:
-                    ball_err = float(np.linalg.norm(future_world[0] - current_pos))
-                else:
-                    ball_err = float(np.linalg.norm(target_world - current_pos))
-                fb_gain = self._feedback_gain(ball_err)
-
-                twist_fb = (twist.copy() if self.use_orientation_task else twist[:3].copy()) * fb_gain
-                twist_ff = np.zeros_like(twist_fb)
-                enable_base_ff = (
-                    self.intercept_planner is None
-                    and (not self.use_pregrasp)
-                    and self.is_ball_rel
-                    and self.base_traj_for_rel is not None
-                    and ((not self.use_offset_tracking) or (self.use_offset_tracking and (not self.offset_active)))
-                )
-                if enable_base_ff:
-                    desired_now = self._control_target_world(sim_time=sim_time, abs_time=self.data.time)
-                    desired_next = future_world[0]
-                    desired_vel = (desired_next - desired_now) / self.control_dt
-                    base_vel = self._base_velocity_world(self.data.time)
-                    ff_xyz = self.base_ff_gain * (desired_vel - base_vel)
-                    if self.use_orientation_task:
-                        twist_ff[:3] = ff_xyz
+                cond_last = float(cond_val)
+                if self.use_constrained_qp:
+                    q_now = self.data.qpos[self.arm_qpos_indices].copy()
+                    ee_x_upper_seq = self._qp_ee_x_upper_sequence(
+                        sim_time=sim_time,
+                        target_world_now=target_world_ref,
+                    )
+                    ee_y_upper_seq = self._qp_ee_y_upper_sequence(
+                        sim_time=sim_time,
+                        target_world_now=target_world_ref,
+                    )
+                    a_cons, l_cons, u_cons = self._build_constrained_qp_bounds(
+                        jac_pinv=jac_pinv,
+                        q_ref=q_now,
+                        current_pos_world=current_pos_world,
+                        ee_x_upper_seq=ee_x_upper_seq,
+                        ee_y_upper_seq=ee_y_upper_seq,
+                    )
+                    twist = self.mpc.solve(
+                        e_hat,
+                        current_state=current_state,
+                        desired_terminal=desired_state,
+                        pos_weight_scales=pos_weight_scales,
+                        extra_rhs=manip_rhs,
+                        linear_constraint_matrix=a_cons,
+                        linear_lower_bound=l_cons,
+                        linear_upper_bound=u_cons,
+                        qp_solver=self.qp_solver,
+                    )
+                    if self.mpc.last_solve_ok:
+                        active_err = float(np.linalg.norm(future_world[0] - current_pos))
+                        if self.use_offset_tracking and self.offset_active:
+                            qp_scale = 1.0
+                        else:
+                            qp_scale = self._qp_qdot_scale(active_err)
+                        if self.use_orientation_task:
+                            twist_cmd = twist.copy() * qp_scale
+                            self.mpc.prev_twist = twist_cmd.copy()
+                        else:
+                            twist_cmd = twist[:3].copy() * qp_scale
+                            self.mpc.prev_twist[:3] = twist_cmd
+                            self.mpc.prev_twist[3:] = 0.0
+                        qdot_raw = jac_pinv @ twist_cmd
+                        qdot_pre_clip = qdot_raw.copy()
+                        qdot_cmd = self._limit_joint_accel(qdot_raw, self.last_qdot_cmd, self.control_dt)
+                        if self.qp_enforce_joint_vel:
+                            qdot_cmd = np.clip(qdot_cmd, -self.velocity_limit, self.velocity_limit)
+                        if self.qp_enforce_ee_x_upper:
+                            qdot_cmd = self._project_qdot_to_axis_upper(
+                                qdot_cmd,
+                                jac_axis_row=jac_full[0],
+                                current_value=float(current_pos_world[0]),
+                                upper_value=float(ee_x_upper_seq[0]),
+                            )
+                        if self.qp_enforce_ee_y_upper:
+                            qdot_cmd = self._project_qdot_to_axis_upper(
+                                qdot_cmd,
+                                jac_axis_row=jac_full[1],
+                                current_value=float(current_pos_world[1]),
+                                upper_value=float(ee_y_upper_seq[0]),
+                            )
+                        self.last_qdot_cmd = qdot_cmd.copy()
+                        q_des = q_now + qdot_cmd * self.control_dt
+                        if self.qp_enforce_joint_pos:
+                            q_des = np.clip(q_des, self.arm_qpos_min, self.arm_qpos_max)
                     else:
-                        twist_ff = ff_xyz
-                twist_cmd = twist_fb + twist_ff
-
-                if cond_val > self.cond_threshold:
-                    scale = np.clip(self.cond_threshold / cond_val, self.min_twist_scale, 1.0)
-                    twist_cmd = twist_cmd * scale
-                    twist_fb = twist_fb * scale
-                twist_cmd, twist_fb = self._limit_twist_cmd(twist_cmd, twist_fb)
-                funnel_anchor = self._funnel_anchor_world(sim_time=sim_time, future_targets=future_world)
-                twist_cmd, twist_fb = self._apply_funnel_to_twist(
-                    current_pos_world=current_pos,
-                    target_world=funnel_anchor,
-                    twist_cmd=twist_cmd,
-                    twist_fb=twist_fb,
-                )
-
-                if self.use_orientation_task:
-                    self.mpc.prev_twist = twist_fb.copy()
+                        if self.qp_infeasible_policy == "hold":
+                            self._log_qp_infeasible(sim_time=float(sim_time))
+                            qdot_cmd = np.zeros(self.arm_dof, dtype=float)
+                            qdot_pre_clip = qdot_cmd.copy()
+                            self.last_qdot_cmd = qdot_cmd.copy()
+                            self.mpc.prev_twist[:] = 0.0
+                        else:
+                            raise RuntimeError(
+                                f"未支持的 qp_infeasible_policy={self.qp_infeasible_policy}"
+                            )
                 else:
-                    self.mpc.prev_twist[:3] = twist_fb
-                    self.mpc.prev_twist[3:] = 0.0
+                    twist = self.mpc.solve(
+                        e_hat,
+                        current_state=current_state,
+                        desired_terminal=desired_state,
+                        pos_weight_scales=pos_weight_scales,
+                        extra_rhs=manip_rhs,
+                    )
+                    if self.intercept_planner is not None or self.use_pregrasp or self.use_offset_tracking:
+                        ball_err = float(np.linalg.norm(future_world[0] - current_pos))
+                    else:
+                        ball_err = float(np.linalg.norm(target_world - current_pos))
+                    fb_gain = self._feedback_gain(ball_err)
 
-                qdot_task = jac_pinv @ twist_cmd
-                vel_ratio_task = np.max(np.abs(qdot_task) / self.velocity_limit)
-                task_budget = float(np.clip(1.0 - vel_ratio_task, 0.0, 1.0))
+                    twist_fb = (twist.copy() if self.use_orientation_task else twist[:3].copy()) * fb_gain
+                    twist_ff = np.zeros_like(twist_fb)
+                    enable_base_ff = (
+                        self.intercept_planner is None
+                        and (not self.use_pregrasp)
+                        and self.is_ball_rel
+                        and self.base_traj_for_rel is not None
+                        and ((not self.use_offset_tracking) or (self.use_offset_tracking and (not self.offset_active)))
+                    )
+                    if enable_base_ff:
+                        ff_phase_gain = (
+                            self._offset_release_progress(self.data.time)
+                            if self.use_offset_tracking
+                            else 1.0
+                        )
+                        desired_now = self._control_target_world(sim_time=sim_time, abs_time=self.data.time)
+                        desired_next = future_world[0]
+                        desired_vel = (desired_next - desired_now) / self.control_dt
+                        base_vel = self._base_velocity_world(self.data.time)
+                        ff_xyz = ff_phase_gain * self.base_ff_gain * (desired_vel - base_vel)
+                        if self.use_orientation_task:
+                            twist_ff[:3] = ff_xyz
+                        else:
+                            twist_ff = ff_xyz
+                    twist_cmd = twist_fb + twist_ff
 
-                null_w = 1.0 / (1.0 + (ball_err / self.nullspace_err_scale) ** 2)
-                joint_offset = self.q_nominal - self.data.qpos[self.arm_qpos_indices]
-                dyn_gain = (self.nullspace_gain * null_w * task_budget) * (
-                    1.0 + np.clip(np.linalg.norm(joint_offset) / self.nullspace_scale, 0.0, 3.0)
-                )
-                nullspace_term = dyn_gain * joint_offset
-                qdot_cmd = qdot_task + (
-                    (np.identity(self.arm_dof) - jac_pinv @ jac) @ nullspace_term
-                )
-                qdot_pre_clip = qdot_cmd.copy()
-                vel_ratio = np.max(np.abs(qdot_cmd) / self.velocity_limit)
-                if vel_ratio > 1.0:
-                    qdot_cmd = qdot_cmd / vel_ratio
-                qdot_cmd = self._limit_joint_accel(qdot_cmd, self.last_qdot_cmd, self.control_dt)
-                qdot_cmd = np.clip(qdot_cmd, -self.velocity_limit, self.velocity_limit)
-                self.last_qdot_cmd = qdot_cmd.copy()
-                joint_bias = self.drift_gain * joint_offset * self.control_dt
-                q_des = q_des + qdot_cmd * self.control_dt + joint_bias
-                q_des = np.clip(q_des, self.arm_qpos_min, self.arm_qpos_max)
+                    if cond_val > self.cond_threshold:
+                        scale = np.clip(self.cond_threshold / cond_val, self.min_twist_scale, 1.0)
+                        twist_cmd = twist_cmd * scale
+                        twist_fb = twist_fb * scale
+                    twist_cmd, twist_fb = self._limit_twist_cmd(twist_cmd, twist_fb)
+
+                    if self.use_orientation_task:
+                        self.mpc.prev_twist = twist_fb.copy()
+                    else:
+                        self.mpc.prev_twist[:3] = twist_fb
+                        self.mpc.prev_twist[3:] = 0.0
+
+                    qdot_task = jac_pinv @ twist_cmd
+                    vel_ratio_task = np.max(np.abs(qdot_task) / self.velocity_limit)
+                    task_budget = float(np.clip(1.0 - vel_ratio_task, 0.0, 1.0))
+
+                    null_w = 1.0 / (1.0 + (ball_err / self.nullspace_err_scale) ** 2)
+                    joint_offset = self.q_nominal - self.data.qpos[self.arm_qpos_indices]
+                    dyn_gain = (self.nullspace_gain * null_w * task_budget) * (
+                        1.0 + np.clip(np.linalg.norm(joint_offset) / self.nullspace_scale, 0.0, 3.0)
+                    )
+                    nullspace_term = dyn_gain * joint_offset
+                    qdot_cmd = qdot_task + (
+                        (np.identity(self.arm_dof) - jac_pinv @ jac) @ nullspace_term
+                    )
+                    qdot_pre_clip = qdot_cmd.copy()
+                    vel_ratio = np.max(np.abs(qdot_cmd) / self.velocity_limit)
+                    if vel_ratio > 1.0:
+                        qdot_cmd = qdot_cmd / vel_ratio
+                    qdot_cmd = self._limit_joint_accel(qdot_cmd, self.last_qdot_cmd, self.control_dt)
+                    qdot_cmd = np.clip(qdot_cmd, -self.velocity_limit, self.velocity_limit)
+                    self.last_qdot_cmd = qdot_cmd.copy()
+                    joint_bias = self.drift_gain * joint_offset * self.control_dt
+                    q_des = q_des + qdot_cmd * self.control_dt + joint_bias
+                    q_des = np.clip(q_des, self.arm_qpos_min, self.arm_qpos_max)
 
                 if callback is not None:
                     terminal_err = self._terminal_error(
@@ -1531,6 +1991,9 @@ class MPCController:
                             "manip_w": float(self._manip_last_w),
                             "manip_risk": float(self._manip_last_risk),
                             "uncertainty_scale_first": uncertainty_scale_first,
+                            "qp_enabled": bool(self.use_constrained_qp),
+                            "qp_ok": bool(self.mpc.last_solve_ok),
+                            "qp_status": str(self.mpc.last_solve_status),
                         }
                     )
 
@@ -1538,7 +2001,6 @@ class MPCController:
 
             mujoco.mj_step(self.model, self.data)
             if viewer and (step_count % self.render_every == 0):
-                self._draw_funnel_marker(viewer, target_world_ref)
                 viewer.sync()
             step_count += 1
 
@@ -1549,12 +2011,44 @@ class MPCController:
             target_world_ref_now = self._world_target(sim_time_now)
             current_pos_world_now = self.data.site_xpos[self.ee_site_id].copy()
             target_err_now = float(np.linalg.norm(current_pos_world_now - target_world_ref_now))
-            hold_ref_now = target_world_ref_now + np.array([0.0, self.offset_y, 0.0], dtype=float)
-            hold_err_now = float(np.linalg.norm(current_pos_world_now - hold_ref_now))
-            in_funnel_now = self._arm_any_in_funnel_geometry(target_world_ref_now)
+            log_due = sim_time - last_log_time >= self.profile_period
             phase_now = "hold" if (self.use_offset_tracking and self.offset_active) else "attach"
+            hold_ref_now = None
+            hold_err_now = np.nan
 
             if step_callback is not None:
+                hold_ref_now = target_world_ref_now + np.array([0.0, self.offset_y, 0.0], dtype=float)
+                hold_err_now = float(np.linalg.norm(current_pos_world_now - hold_ref_now))
+                active_ref_now = self._control_target_world(
+                    sim_time=sim_time_now,
+                    abs_time=float(self.data.time),
+                )
+                active_err_now = float(np.linalg.norm(current_pos_world_now - active_ref_now))
+                base_traj_time_now = float(
+                    sim_time_now if self.use_offset_tracking else self.data.time
+                )
+                base_pos_world_now = self._base_pos_world(base_traj_time_now)
+                base_vel_world_now = self._base_velocity_world(base_traj_time_now)
+                base_speed_norm_now = float(np.linalg.norm(base_vel_world_now))
+                base_stop_time_now = self._base_stop_time()
+                if np.isfinite(base_stop_time_now):
+                    base_time_to_stop_now = float(base_stop_time_now - base_traj_time_now)
+                else:
+                    base_time_to_stop_now = np.nan
+                delta_hold_now = current_pos_world_now - hold_ref_now
+                delta_target_now = current_pos_world_now - target_world_ref_now
+                offset_dist_now = (
+                    float(
+                        hold_err_now
+                        if (self.use_offset_tracking and self.offset_active)
+                        else np.linalg.norm(current_pos_world_now - active_ref_now)
+                    )
+                    if self.use_offset_tracking
+                    else np.nan
+                )
+                x_gate_ready_now = bool(self._offset_x_gate_ready)
+                x_gate_threshold_now = float(self._offset_x_gate_threshold)
+                x_gate_delta_now = float(self._offset_x_gate_delta)
                 step_callback(
                     {
                         "step": int(step_count),
@@ -1563,22 +2057,65 @@ class MPCController:
                         "phase": phase_now,
                         "target_err": target_err_now,
                         "hold_err": hold_err_now,
+                        "active_err": active_err_now,
                         "attach_err": target_err_now,
-                        "in_funnel": bool(in_funnel_now),
+                        "ee_pos": current_pos_world_now.copy(),
+                        "target_ref": target_world_ref_now.copy(),
+                        "hold_ref": hold_ref_now.copy(),
+                        "active_ref": active_ref_now.copy(),
+                        "base_pos_world": base_pos_world_now.copy(),
+                        "base_vel_world": base_vel_world_now.copy(),
+                        "base_speed_norm": base_speed_norm_now,
+                        "base_stop_time": float(base_stop_time_now),
+                        "base_time_to_stop": float(base_time_to_stop_now),
+                        "dx_hold": float(delta_hold_now[0]),
+                        "dy_hold": float(delta_hold_now[1]),
+                        "dz_hold": float(delta_hold_now[2]),
+                        "dx_target": float(delta_target_now[0]),
+                        "dy_target": float(delta_target_now[1]),
+                        "dz_target": float(delta_target_now[2]),
+                        "offset_dist_now": float(offset_dist_now),
+                        "offset_hit_count": int(self._offset_hit_count),
+                        "offset_trigger_steps": int(self.offset_trigger_steps),
+                        "offset_x_gate_enable": bool(self.offset_switch_x_gate_enable),
+                        "offset_x_gate_ready": bool(x_gate_ready_now),
+                        "offset_x_gate_threshold": float(x_gate_threshold_now),
+                        "offset_x_gate_delta": float(x_gate_delta_now),
+                        "qp_ok": bool(self.mpc.last_solve_ok),
+                        "qp_status": str(self.mpc.last_solve_status),
+                        "qdot_norm": float(np.linalg.norm(self.last_qdot_cmd)),
+                        "jac_cond": float(cond_last),
                         "grasped": bool(self.grasped),
                     }
                 )
 
-            if sim_time - last_log_time >= self.profile_period:
-                # target_err: 始终是 end_finger 到真实 target_world_ref 的距离，不受偏置影响。
-                if self.grasped:
-                    print(
-                        f"[grasp success] time={self.data.time:.2f}s, target_err={target_err_now:.4f} m"
-                    )
-                elif self.use_offset_tracking and self.offset_active:
-                    print(f"[hold] time={self.data.time:.2f}s, hold_err={hold_err_now:.4f} m")
+            if log_due:
+                if phase_now == "hold":
+                    if hold_ref_now is None:
+                        hold_ref_now = target_world_ref_now + np.array(
+                            [0.0, self.offset_y, 0.0], dtype=float
+                        )
+                        hold_err_now = float(np.linalg.norm(current_pos_world_now - hold_ref_now))
+                    phase_target_now = hold_ref_now
+                    phase_err_now = hold_err_now
                 else:
-                    print(f"[attach] time={self.data.time:.2f}s, target_err={target_err_now:.4f} m")
+                    phase_target_now = target_world_ref_now
+                    phase_err_now = target_err_now
+
+                ee_fmt = (
+                    f"[{current_pos_world_now[0]:+.3f},{current_pos_world_now[1]:+.3f},"
+                    f"{current_pos_world_now[2]:+.3f}]"
+                )
+                phase_target_fmt = (
+                    f"[{phase_target_now[0]:+.3f},{phase_target_now[1]:+.3f},"
+                    f"{phase_target_now[2]:+.3f}]"
+                )
+                phase_label = "grasp success" if self.grasped else phase_now
+                print(
+                    f"[{phase_label}] t={self.data.time:.2f}s, "
+                    f"err={phase_err_now:.4f} m, "
+                    f"ee={ee_fmt}, ref={phase_target_fmt}"
+                )
                 last_log_time = sim_time
 
             if self.use_pregrasp and (not self.approach_active) and (not self.use_predictive_phase_switch):
@@ -1612,7 +2149,14 @@ class MPCController:
                     hold_ok = self._grasp_time >= self.grasp_hold_time_s
                 if hold_ok:
                     self.grasped = True
-                    print(f"[grasp success] time={self.data.time:.2f}s, target_err={grasp_dist:.4f} m")
+                    ee_now = self.data.site_xpos[self.ee_site_id].copy()
+                    tgt_now = self._world_target(self.data.time - self.time_offset)
+                    ee_fmt = f"[{ee_now[0]:+.3f},{ee_now[1]:+.3f},{ee_now[2]:+.3f}]"
+                    tgt_fmt = f"[{tgt_now[0]:+.3f},{tgt_now[1]:+.3f},{tgt_now[2]:+.3f}]"
+                    print(
+                        f"[grasp success] t={self.data.time:.2f}s, "
+                        f"err={grasp_dist:.4f} m, ee={ee_fmt}, ref={tgt_fmt}"
+                    )
                     if self.grasp_action == "attach":
                         self._attach_target = True
                     elif self.grasp_action == "stop":
@@ -1710,7 +2254,6 @@ class MPCController:
                 viewer.cam.distance = 3.0
                 viewer.cam.azimuth = 0.0
                 viewer.cam.elevation = -25.0
-                self._draw_funnel_marker(viewer, start_world)
                 viewer.sync()
                 if sys.stdin is not None and sys.stdin.isatty():
                     print("[start] 视角可先调整；准备好后在终端按回车开始仿真...")
@@ -1750,7 +2293,7 @@ class MPCController:
                     f"ee={ee_after}, cond={cond_after:.1e}, sim_t={self.data.time:.2f}s, "
                     f"q_nominal={nominal_note} (settle_tol={settle_tol:.2f}, cond_max={nominal_cond_max:.1e})"
                 )
-                self._control_loop(viewer=viewer)
+                self._control_loop(viewer=viewer, realtime_sync=False)
         else:
             print("mujoco.viewer 不可用，使用 headless 模式运行以获取误差日志。")
             final_dist = self._warm_start_to_pose(
