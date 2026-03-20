@@ -3,18 +3,29 @@ import struct
 import time
 from typing import Optional
 
+import numpy as np
+
 # ================= 配置区域 =================
 # 请根据机器人实际情况修改 IP
 ROBOT_IP = "192.168.100.178"  
 ROBOT_PORT = 17804          # 导航控制服务端口
 
 # 协议授权码（16字节）：你的实车配置
-AUTH_CODE = bytes.fromhex("31 04 25 49 2b 32 af 48 8f f1 82 ee 8b 93 5e 68")    #2d
-# AUTH_CODE = bytes.fromhex("de c9 9d 62 0a 8a f9 4a a4 28 f4 0e fc 46 11 36")  #3d
+# AUTH_CODE = bytes.fromhex("31 04 25 49 2b 32 af 48 8f f1 82 ee 8b 93 5e 68")  #2d
+AUTH_CODE = bytes.fromhex("de c9 9d 62 0a 8a f9 4a a4 28 f4 0e fc 46 11 36")  #3d
 
 # 轮询周期（这里默认 20ms）
 POLL_PERIOD_S = 0.02
 
+# 仿真坐标系定义:
+# 使用「起点 -> 终点」方向作为仿真 x 轴正方向。
+# 这两个点请填在与你 UDP 位置一致的平面坐标系下（通常是地图坐标，单位 m）。
+SIM_FRAME_START_XY = (0.0, 0.0)
+SIM_FRAME_END_XY = (1.0, 0.0)
+
+# 仿真目标点（小球）在 UDP 坐标系下的位置（x, y, z）
+# 其中 z 不参与平面旋转，仅作为仿真中的目标高度直接使用。
+SIM_TARGET_POS_REAL = (0.25, 0.50, 1.20)
 
 # UDP 接收超时
 SOCKET_TIMEOUT_S = 2.0
@@ -37,6 +48,67 @@ DEFAULT_NAV_PATH_POINT_IDS = [3, 4]
 
 # 0x14 手动定位（可按需改/或通过命令行传入）
 DEFAULT_MANUAL_LOCALIZE_POSE = (0.05, 0.038, 0.0)
+
+
+def _frame_start_end_xy() -> tuple[np.ndarray, np.ndarray]:
+    start = np.asarray(SIM_FRAME_START_XY, dtype=float).reshape(2)
+    end = np.asarray(SIM_FRAME_END_XY, dtype=float).reshape(2)
+    if float(np.linalg.norm(end - start)) < 1e-9:
+        raise ValueError("SIM_FRAME_START_XY 与 SIM_FRAME_END_XY 不能重合")
+    return start, end
+
+
+def frame_axes_xy() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    返回:
+        start_xy: 新坐标系原点（对应起点）
+        x_axis: 新坐标系 x 轴单位向量（起点->终点方向）
+        y_axis: 新坐标系 y 轴单位向量（z 轴朝上时左手侧法向）
+    """
+    start, end = _frame_start_end_xy()
+    x_axis = end - start
+    x_axis = x_axis / max(float(np.linalg.norm(x_axis)), 1e-12)
+    y_axis = np.array([-x_axis[1], x_axis[0]], dtype=float)
+    return start, x_axis, y_axis
+
+
+def real_xy_to_new_frame_xy(x_real: float, y_real: float) -> np.ndarray:
+    """
+    将 UDP/map 坐标系下的 (x,y) 转到“起点为原点、起点->终点为 +x”的新平面坐标系。
+    """
+    start, x_axis, y_axis = frame_axes_xy()
+    delta = np.array([float(x_real), float(y_real)], dtype=float) - start
+    x_new = float(delta @ x_axis)
+    y_new = float(delta @ y_axis)
+    return np.array([x_new, y_new], dtype=float)
+
+
+def real_xy_to_sim_world_xy(x_real: float, y_real: float, sim_origin_xy: np.ndarray) -> np.ndarray:
+    """
+    将 UDP/map 坐标转换到 MuJoCo 世界坐标的平面坐标:
+        sim_xy = sim_origin_xy + new_frame_xy
+    """
+    sim_origin_xy = np.asarray(sim_origin_xy, dtype=float).reshape(2)
+    rel_xy = real_xy_to_new_frame_xy(x_real, y_real)
+    return sim_origin_xy + rel_xy
+
+
+def target_world_in_sim(sim_origin_xyz: np.ndarray) -> np.ndarray:
+    """
+    读取配置中的目标点并转换到 MuJoCo 世界坐标。
+    """
+    sim_origin_xyz = np.asarray(sim_origin_xyz, dtype=float).reshape(3)
+    tgt = np.asarray(SIM_TARGET_POS_REAL, dtype=float).reshape(3)
+    tgt_xy_world = real_xy_to_sim_world_xy(float(tgt[0]), float(tgt[1]), sim_origin_xyz[:2])
+    return np.array([float(tgt_xy_world[0]), float(tgt_xy_world[1]), float(tgt[2])], dtype=float)
+
+
+def target_in_robot_frame(sim_origin_xyz: np.ndarray) -> np.ndarray:
+    """
+    返回配置目标点在机械臂/底盘坐标系下的位置（基于仿真起点时刻）。
+    """
+    sim_origin_xyz = np.asarray(sim_origin_xyz, dtype=float).reshape(3)
+    return target_world_in_sim(sim_origin_xyz) - sim_origin_xyz
 
 
 def build_command(seq_num: int, cmd: int, payload: bytes = b"") -> bytes:

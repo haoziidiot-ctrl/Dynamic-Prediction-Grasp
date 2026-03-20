@@ -35,21 +35,30 @@ if __name__ == "__main__":
     # 约束版本默认关闭 RL 终端价值，专注约束接近策略
     USE_TERMINAL_VALUE = False
     TERMINAL_VALUE_DIM = 3
-    POS_WEIGHT = 14.0
-    # 姿态项降低，优先保证位置误差收敛到 grasp 阈值内
-    ROT_WEIGHT = 0.12
+    POS_WEIGHT = 26.0
+    # 适度提高姿态项，抑制末端在接近阶段出现 z 轴下冲
+    ROT_WEIGHT = 0.25
+    SMOOTH_WEIGHT = 1.5e-3
     TARGET_FACING_DIR = (0.0, 1.0, 0.0)
-    # GUI 性能参数：60Hz 渲染 + 0.5s 一次简化日志
-    RENDER_DT = 1.0 / 60.0
-    PROFILE_PERIOD = 0.5
+    # GUI 性能参数：降低渲染压力，优先保证控制实时性
+    RENDER_DT = 1.0 / 50.0
+    PROFILE_PERIOD = 0.1
 
-    # analytic 版本默认走原始解析解：先用线性解析解求 task-space MPC，
-    # 再在后续雅可比映射/速度位置裁剪链路里处理执行层限制。
-    USE_CONSTRAINED_QP = False
+    # random_mpc 主开关：True=约束QP链路（含底盘前馈补偿），False=默认解析链路
+    USE_CONSTRAINED_QP = True
+    # 实时优化：降低控制刷新率与视界长度，显著减小 QP 计算负载
+    CONTROL_DT = 0.03
+    MPC_HORIZON = 6
     QP_SOLVER = "osqp"
     QP_INFEASIBLE_POLICY = "hold"
     QP_ENFORCE_JOINT_POS = True
     QP_ENFORCE_JOINT_VEL = True
+    QP_ENFORCE_EE_X_UPPER = True
+    QP_EE_X_MARGIN = -0.015
+    QP_ENFORCE_EE_Y_UPPER = True
+    QP_EE_Y_MARGIN = 0.0
+    QP_ENFORCE_EE_Z_LOWER = True
+    QP_EE_Z_MARGIN = -0.010
 
     # 两阶段切换：
     # 1) 第一阶段跟踪 target + [0, OFFSET_Y, 0]
@@ -74,10 +83,20 @@ if __name__ == "__main__":
 
     USE_OFFSET_TRACKING = True
     OFFSET_Y = -0.13
-    OFFSET_SWITCH_TOL = 0.02
+    OFFSET_RELEASE_TIME_S = 0.45
+    HOLD_POS_WEIGHT_SCALE = 1.0
+    ATTACH_POS_WEIGHT_SCALE = 1.15
+    HOLD_X_ERROR_GAIN = 1.0
+    ATTACH_X_ERROR_GAIN = 1.00
+    HOLD_ORIENTATION_GAIN = 1.0
+    ATTACH_ORIENTATION_GAIN = 0.28
+    # 提前切换到 attach：放宽 hold 误差门限 + 减少连续命中步数
+    OFFSET_SWITCH_TOL = 0.03
     OFFSET_SWITCH_STEPS = 8
     OFFSET_SWITCH_X_GATE_ENABLE = True
-    OFFSET_SWITCH_X_FRONT = 0.20
+    OFFSET_SWITCH_X_FRONT = 0.05
+    OFFSET_SWITCH_X_ALIGN_TOL = 0.04
+    OFFSET_SWITCH_YZ_TOL = 0.09
     WARM_START_MAX = 0.0
 
     # 创新点1：不确定性感知自适应 MPC（KF 协方差 -> 误差项权重）
@@ -87,20 +106,23 @@ if __name__ == "__main__":
     UNCERTAINTY_EMA = 0.15
 
     # 创新点3：操作度梯度引导（低操作度时给 MPC 一个远离奇异位的任务空间偏置）
-    ENABLE_MANIP_GUIDANCE = True
+    # 操作度引导计算代价较高，默认关闭以优先保证 random_mpc 实时性
+    ENABLE_MANIP_GUIDANCE = False
     MANIP_LAMBDA = 0.025
     MANIP_W_THRESHOLD = 0.06
     MANIP_FD_DELTA = 0.004
     MANIP_GRAD_CLIP = 2.0
     MANIP_HORIZON_DECAY = 0.8
     MANIP_FIRST_STEP_ONLY = False
+    BASE_FF_GAIN = 1.0
+    EE_LINEAR_SPEED_LIMIT = 0.75
 
     ENABLE_GRASP = True
     # grasp success 判定：end_finger 到真实 target 距离需小于 0.02 m
     GRASP_TOL = 0.02
     GRASP_HOLD_STEPS = 10
     GRASP_HOLD_TIME_S = None  # 用 GRASP_HOLD_STEPS(10步)判定成功，避免1s停留导致错失动态抓取窗口
-    GRASP_ACTION = "none"  # "none" / "stop" / "attach"
+    GRASP_ACTION = "attach"  # "none" / "stop" / "attach"
     traj = build_trajectory(OBJECT_TRACK, kf_cfg=KF_CFG)
     if hasattr(traj, "ball_world"):
         print(f"[target] ball_world(from trajectory) = {np.asarray(traj.ball_world, dtype=float)}")
@@ -119,9 +141,12 @@ if __name__ == "__main__":
         )
     MPCController(
         trajectory=traj,
+        horizon=MPC_HORIZON,
+        control_dt=CONTROL_DT,
         warm_start_max=WARM_START_MAX,
         pos_weight=POS_WEIGHT,
         rot_weight=ROT_WEIGHT,
+        smooth_weight=SMOOTH_WEIGHT,
         render_dt=RENDER_DT,
         profile_period=PROFILE_PERIOD,
         use_terminal_value=USE_TERMINAL_VALUE,
@@ -147,10 +172,19 @@ if __name__ == "__main__":
         phase_instant_attack=PHASE_INSTANT_ATTACK,
         use_offset_tracking=USE_OFFSET_TRACKING,
         offset_y=OFFSET_Y,
+        offset_release_time_s=OFFSET_RELEASE_TIME_S,
+        hold_pos_weight_scale=HOLD_POS_WEIGHT_SCALE,
+        attach_pos_weight_scale=ATTACH_POS_WEIGHT_SCALE,
+        hold_x_error_gain=HOLD_X_ERROR_GAIN,
+        attach_x_error_gain=ATTACH_X_ERROR_GAIN,
+        hold_orientation_gain=HOLD_ORIENTATION_GAIN,
+        attach_orientation_gain=ATTACH_ORIENTATION_GAIN,
         offset_trigger_tol=OFFSET_SWITCH_TOL,
         offset_trigger_steps=OFFSET_SWITCH_STEPS,
         offset_switch_x_gate_enable=OFFSET_SWITCH_X_GATE_ENABLE,
         offset_switch_x_front=OFFSET_SWITCH_X_FRONT,
+        offset_switch_x_align_tol=OFFSET_SWITCH_X_ALIGN_TOL,
+        offset_switch_yz_tol=OFFSET_SWITCH_YZ_TOL,
         use_uncertainty_aware_weighting=ENABLE_UNCERTAINTY_AWARE,
         uncertainty_beta=UNCERTAINTY_BETA,
         uncertainty_min_scale=UNCERTAINTY_MIN_SCALE,
@@ -162,6 +196,8 @@ if __name__ == "__main__":
         manipulability_grad_clip=MANIP_GRAD_CLIP,
         manipulability_horizon_decay=MANIP_HORIZON_DECAY,
         manipulability_first_step_only=MANIP_FIRST_STEP_ONLY,
+        base_ff_gain=BASE_FF_GAIN,
+        ee_linear_speed_limit=EE_LINEAR_SPEED_LIMIT,
         enable_grasp=ENABLE_GRASP,
         grasp_tol=GRASP_TOL,
         grasp_hold_steps=GRASP_HOLD_STEPS,
@@ -172,4 +208,10 @@ if __name__ == "__main__":
         qp_infeasible_policy=QP_INFEASIBLE_POLICY,
         qp_enforce_joint_pos=QP_ENFORCE_JOINT_POS,
         qp_enforce_joint_vel=QP_ENFORCE_JOINT_VEL,
+        qp_enforce_ee_x_upper=QP_ENFORCE_EE_X_UPPER,
+        qp_ee_x_margin=QP_EE_X_MARGIN,
+        qp_enforce_ee_y_upper=QP_ENFORCE_EE_Y_UPPER,
+        qp_ee_y_margin=QP_EE_Y_MARGIN,
+        qp_enforce_ee_z_lower=QP_ENFORCE_EE_Z_LOWER,
+        qp_ee_z_margin=QP_EE_Z_MARGIN,
     ).run()

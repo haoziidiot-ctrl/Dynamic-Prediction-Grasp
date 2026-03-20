@@ -112,8 +112,8 @@ class RealTimeBaseTrajectory(BaseTrajectory):
 
     poll_period_s: float = field(default_factory=lambda: float(udp.POLL_PERIOD_S))
     socket_timeout_s: float = 0.05
-    sigma_a: float = 0.05
-    meas_noise: float = 0.002
+    sigma_a: float = 0.08
+    meas_noise: float = 0.005
     seed_velocity_from_first_two_measurements: bool = True
 
     sim_origin: Optional[np.ndarray] = None
@@ -175,23 +175,33 @@ class RealTimeBaseTrajectory(BaseTrajectory):
             self._wall_sim_offset = now - float(sim_time_now)
 
     def _map_real_to_sim_xy(self, x_real: float, y_real: float) -> np.ndarray:
-        if self.use_relative_origin:
-            if self._real_origin_xy is None:
-                self._real_origin_xy = np.array([x_real, y_real], dtype=float)
-                dx, dy = 0.0, 0.0
+        # 按 get_robot_status.py 中“起点->终点定义的新坐标系”做坐标变换，
+        # 再平移到仿真底盘初始原点附近。
+        try:
+            sim_xy = udp.real_xy_to_sim_world_xy(
+                float(x_real),
+                float(y_real),
+                np.array([float(self.sim_origin[0]), float(self.sim_origin[1])], dtype=float),
+            )
+            return np.asarray(sim_xy, dtype=float).reshape(2)
+        except Exception:
+            # 兼容兜底：若上面变换配置异常，则回落到旧的“相对首帧”逻辑，避免线程中断。
+            if self.use_relative_origin:
+                if self._real_origin_xy is None:
+                    self._real_origin_xy = np.array([x_real, y_real], dtype=float)
+                    dx, dy = 0.0, 0.0
+                else:
+                    dx = x_real - float(self._real_origin_xy[0])
+                    dy = y_real - float(self._real_origin_xy[1])
             else:
-                dx = x_real - float(self._real_origin_xy[0])
-                dy = y_real - float(self._real_origin_xy[1])
-        else:
-            dx, dy = x_real, y_real
+                dx, dy = x_real, y_real
 
-        if self.swap_xy:
-            dx, dy = dy, dx
+            if self.swap_xy:
+                dx, dy = dy, dx
 
-        dx *= float(self.sign_x)
-        dy *= float(self.sign_y)
-
-        return np.array([float(self.sim_origin[0]) + dx, float(self.sim_origin[1]) + dy], dtype=float)
+            dx *= float(self.sign_x)
+            dy *= float(self.sign_y)
+            return np.array([float(self.sim_origin[0]) + dx, float(self.sim_origin[1]) + dy], dtype=float)
 
     def _worker(self):
         dt = float(self.poll_period_s)
@@ -293,3 +303,31 @@ class RealTimeBaseTrajectory(BaseTrajectory):
         xq = float(x[0]) + float(x[1]) * delta
         yq = float(x[2]) + float(x[3]) * delta
         return np.array([xq, yq, z0], dtype=float)
+
+    def future_covariances_xy(self, horizon: int, dt: float) -> np.ndarray:
+        if horizon <= 0:
+            return np.zeros((0, 2, 2), dtype=float)
+        dt = max(float(dt), 1e-9)
+        q11 = 0.25 * dt**4
+        q12 = 0.5 * dt**3
+        q22 = dt**2
+        q_1d = np.array([[q11, q12], [q12, q22]], dtype=float) * (float(self.sigma_a) ** 2)
+        q = np.zeros((4, 4), dtype=float)
+        q[0:2, 0:2] = q_1d
+        q[2:4, 2:4] = q_1d
+        f = np.array(
+            [
+                [1.0, dt, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, dt],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+        with self._lock:
+            p = self._p.copy()
+        out = np.zeros((int(horizon), 2, 2), dtype=float)
+        for i in range(int(horizon)):
+            p = f @ p @ f.T + q
+            out[i] = p[np.ix_([0, 2], [0, 2])]
+        return out

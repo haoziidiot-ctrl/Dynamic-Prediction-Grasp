@@ -1,0 +1,35 @@
+{
+  "episodes": 200,
+  "seed": 20260306,
+  "ball_world": [
+    0.25,
+    0.5,
+    1.2
+  ],
+  "ablation": "uncertainty_aware_weighting on/off",
+  "random_ranges": {
+    "x_start": [
+      -1.1,
+      -0.5
+    ],
+    "x_end": [
+      0.2,
+      0.8
+    ],
+    "speed": [
+      0.1,
+      0.5
+    ],
+    "y_noise_mean": [
+      0.005,
+      0.02
+    ],
+    "y_noise_std_fixed": 0.005
+  },
+  "zone_rule": {
+    "x_exclusion_half_width": 0.05,
+    "y_window_back": 0.1,
+    "points": "6 arm joint bodies + end_finger site"
+  },
+  "fairness": "paired same-random-params per episode"
+}

@@ -1,0 +1,72 @@
+{
+  "episodes": 10,
+  "seed": 20260306,
+  "ball_world": [
+    0.25,
+    0.5,
+    1.2
+  ],
+  "ablation": "random_mpc on/off",
+  "switch_mapping": {
+    "random_mpc_on": {
+      "use_constrained_qp": true,
+      "qp_constraints": [
+        "ee_x_upper",
+        "ee_y_upper",
+        "ee_z_lower"
+      ],
+      "qp_margins": {
+        "x": -0.015,
+        "y": 0.0,
+        "z": -0.01
+      },
+      "activation": {
+        "enable_during_hold": false,
+        "activate_x_err_threshold": 0.12
+      },
+      "zone_avoidance": {
+        "enabled": true,
+        "x_half_width": 0.05,
+        "y_back": 0.1,
+        "y_margin": 0.005,
+        "x_gate_margin": 0.01,
+        "escape_gain_x": 1.6,
+        "escape_gain_y": 1.2,
+        "escape_speed_cap": 0.28
+      }
+    },
+    "random_mpc_off": {
+      "use_constrained_qp": false,
+      "path": "default analytic mpc"
+    }
+  },
+  "fixed_switches": {
+    "use_uncertainty_aware_weighting": true,
+    "use_manipulability_guidance": false
+  },
+  "random_ranges": {
+    "x_start": [
+      -1.1,
+      -0.5
+    ],
+    "x_end": [
+      0.2,
+      0.8
+    ],
+    "speed": [
+      0.1,
+      0.5
+    ],
+    "y_noise_mean": [
+      0.005,
+      0.02
+    ],
+    "y_noise_std_fixed": 0.005
+  },
+  "zone_rule": {
+    "x_exclusion_half_width": 0.05,
+    "y_window_back": 0.1,
+    "points": "6 arm joint bodies + end_finger site"
+  },
+  "fairness": "paired same-random-params per episode"
+}

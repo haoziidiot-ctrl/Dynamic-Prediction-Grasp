@@ -1,2 +1,0 @@
-episodes,success_count,success_rate,total_steps,zone_steps_total,zone_time_total_s,zone_time_mean_s_per_episode,zone_step_ratio,hold_steps_total,hold_err_mean_global,attach_steps_total,attach_err_mean_global
-200,195,0.975,1075990,74732,149.464,0.74732,0.06945417708343014,222975,0.46095045037868987,853015,0.028732019377054618

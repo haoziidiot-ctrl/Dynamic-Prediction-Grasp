@@ -1,0 +1,2 @@
+episode,success_delta_on_minus_off,zone_time_delta_on_minus_off,zone_ratio_delta_on_minus_off,target_err_mean_delta_on_minus_off,attach_err_mean_delta_on_minus_off,hf_target_err_diff_rms_delta_on_minus_off,hf_attach_err_diff_rms_delta_on_minus_off,hf_qdot_diff_rms_delta_on_minus_off,win_zone_time_on,win_attach_err_on,win_hf_attach_on,win_hf_qdot_on
+1,-1.0,1.522,0.577828397873956,0.09939274767532069,nan,0.00039035489154040366,nan,-0.008537498819802092,0.0,nan,nan,1.0
